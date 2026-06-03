@@ -1,0 +1,18 @@
+services:
+  wyze-snapshot:
+    build: .
+    image: wyze-snapshot:local
+    container_name: wyze-snapshot
+    # HA runs network_mode: host; go2rtc's :1984 API is reached on loopback and
+    # KVS WebRTC needs unrestricted UDP for the TURN relay, so use host net too.
+    network_mode: host
+    # Mount HA's config dir (sibling ./config of the HA compose). We READ the
+    # Wyze tokens from /config/.storage/core.config_entries and WRITE JPEGs to
+    # /config/wyze_snapshots/.
+    volumes:
+      - ../config:/config
+    environment:
+      - REFRESH_SECONDS=600
+      - OUT_DIR=/config/wyze_snapshots
+      - CONFIG_ENTRIES=/config/.storage/core.config_entries
+    restart: unless-stopped

@@ -1,0 +1,127 @@
+# Cameras dashboard: Wyze still tiles -> tap for live WebRTC.
+#
+# Wired into the sidebar via `lovelace: dashboards:` in configuration.yaml.
+# Deployed to /config/dashboards/cameras.yaml on the hassio VM.
+#
+# Each picture-entity card renders the still snapshot (camera_image =
+# camera.wyze_<key>_snapshot, a local_file camera fed by the wyze-snapshot
+# sidecar -- zero streaming, just a file re-read) while `entity` points at the
+# live WebRTC camera (camera.<key>) so a tap opens the live stream more-info.
+title: Cameras
+views:
+  - title: Wyze
+    path: wyze
+    icon: mdi:cctv
+    cards:
+      - type: markdown
+        content: "## Online"
+      - type: grid
+        columns: 3
+        square: false
+        cards:
+          - type: picture-entity
+            entity: camera.front_door
+            camera_image: camera.wyze_front_door_snapshot
+            name: Front Door
+            show_state: false
+          - type: picture-entity
+            entity: camera.garden
+            camera_image: camera.wyze_garden_snapshot
+            name: Garden
+            show_state: false
+          - type: picture-entity
+            entity: camera.catio
+            camera_image: camera.wyze_catio_snapshot
+            name: Catio
+            show_state: false
+          - type: picture-entity
+            entity: camera.studio
+            camera_image: camera.wyze_studio_snapshot
+            name: Studio
+            show_state: false
+          - type: picture-entity
+            entity: camera.shop
+            camera_image: camera.wyze_shop_snapshot
+            name: Shop
+            show_state: false
+          - type: picture-entity
+            entity: camera.toolbox
+            camera_image: camera.wyze_toolbox_snapshot
+            name: Toolbox
+            show_state: false
+          - type: picture-entity
+            entity: camera.roundabout
+            camera_image: camera.wyze_roundabout_snapshot
+            name: Roundabout
+            show_state: false
+          - type: picture-entity
+            entity: camera.cat_flap
+            camera_image: camera.wyze_cat_flap_snapshot
+            name: Cat Flap
+            show_state: false
+          - type: picture-entity
+            entity: camera.3d_printer
+            camera_image: camera.wyze_3d_printer_snapshot
+            name: 3D Printer
+            show_state: false
+          - type: picture-entity
+            entity: camera.garden_meadow
+            camera_image: camera.wyze_garden_meadow_snapshot
+            name: Garden Meadow
+            show_state: false
+          - type: picture-entity
+            entity: camera.greenhouse_north
+            camera_image: camera.wyze_greenhouse_north_snapshot
+            name: Greenhouse North
+            show_state: false
+          - type: picture-entity
+            entity: camera.outside_studio
+            camera_image: camera.wyze_outside_studio_snapshot
+            name: Outside Studio
+            show_state: false
+      - type: markdown
+        content: "## Offline"
+      - type: grid
+        columns: 3
+        square: false
+        cards:
+          - type: picture-entity
+            entity: camera.tammy
+            camera_image: camera.wyze_tammy_snapshot
+            name: Tammy
+            show_state: false
+          - type: picture-entity
+            entity: camera.tbd
+            camera_image: camera.wyze_tbd_snapshot
+            name: TBD
+            show_state: false
+          - type: picture-entity
+            entity: camera.back_yard_cam
+            camera_image: camera.wyze_back_yard_cam_snapshot
+            name: Back Yard Cam
+            show_state: false
+          - type: picture-entity
+            entity: camera.sprouting_shed_1
+            camera_image: camera.wyze_sprouting_shed_1_snapshot
+            name: Sprouting Shed 1
+            show_state: false
+          - type: picture-entity
+            entity: camera.sprouting_shed_2
+            camera_image: camera.wyze_sprouting_shed_2_snapshot
+            name: Sprouting Shed 2
+            show_state: false
+          - type: picture-entity
+            entity: camera.garden_pan
+            camera_image: camera.wyze_garden_pan_snapshot
+            name: Garden Pan
+            show_state: false
+          - type: picture-entity
+            entity: camera.greenhouse
+            camera_image: camera.wyze_greenhouse_snapshot
+            name: Greenhouse
+            show_state: false
+          - type: picture-entity
+            entity: camera.back_greenhouse
+            camera_image: camera.wyze_back_greenhouse_snapshot
+            name: Back Greenhouse
+            show_state: false
