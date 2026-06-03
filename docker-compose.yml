@@ -11,6 +11,13 @@ services:
     # /config/wyze_snapshots/.
     volumes:
       - ../config:/config
+      # Front-porch person archive (Hassio-5sa): the proxmox ZFS share
+      # tank/shared, NFS-mounted on this host at /mnt/tank-shared. Person events
+      # on the porch cam copy the current still into <key>/ subdirs here. The
+      # NFS mount must be UP before this container starts, else docker would
+      # auto-create an empty LOCAL /mnt/tank-shared/wyze and writes would miss
+      # the ZFS; fstab _netdev handles that on boot.
+      - /mnt/tank-shared/wyze:/archive
     environment:
       - REFRESH_SECONDS=600
       - OUT_DIR=/config/wyze_snapshots
@@ -32,4 +39,10 @@ services:
       - HA_URL=ws://127.0.0.1:8123/api/websocket
       - HA_TOKEN=${HA_TOKEN:-}
       - EVENT_MIN_INTERVAL=15
+      # Front-porch person archive (Hassio-5sa). Active only when /archive is a
+      # mounted dir (the NFS bind above); reuses the HA_TOKEN listener above.
+      - ARCHIVE_DIR=/archive
+      - PORCH_KEY=front_door
+      - PERSON_TAG=101
+      - ARCHIVE_RETENTION_DAYS=100
     restart: unless-stopped

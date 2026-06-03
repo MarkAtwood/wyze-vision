@@ -27,6 +27,7 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import datetime, timezone
 
 import requests
 from PIL import Image, ImageDraw, ImageFont
@@ -76,6 +77,16 @@ EVENT_TYPE = os.environ.get("EVENT_TYPE", "wyze_camera_event")
 # burst). The periodic cycle is unaffected.
 EVENT_MIN_INTERVAL = int(os.environ.get("EVENT_MIN_INTERVAL", "15"))
 
+# Optional front-porch person archive (Hassio-5sa): on a PERSON event
+# (tag_list contains 101) for the front porch (stream_key PORCH_KEY), copy the
+# current on-disk still to a timestamped file under ARCHIVE_DIR/<key>/, pruned
+# to ARCHIVE_RETENTION_DAYS. Opt-in: active only when ARCHIVE_DIR is a mounted
+# dir (a bind mount of the NFS ZFS share); absent -> the sidecar runs unchanged.
+ARCHIVE_DIR = os.environ.get("ARCHIVE_DIR", "/archive")
+PORCH_KEY = os.environ.get("PORCH_KEY", "front_door")
+PERSON_TAG = os.environ.get("PERSON_TAG", "101")
+ARCHIVE_RETENTION_DAYS = int(os.environ.get("ARCHIVE_RETENTION_DAYS", "100"))
+
 # --- shared state between the periodic cycle and the event listener ----------
 # Serialises go2rtc.restart() (in cycle()) against an event_grab()'s fetch_frame
 # so an on-event grab never races a config swap / process restart.
@@ -86,6 +97,9 @@ _go2rtc_lock = threading.Lock()
 current_streams = set()
 # key -> monotonic time of the last successful/attempted event grab, for debounce.
 _last_grab = {}
+# Set once we've logged that the porch archive is disabled (no /archive mount),
+# so an event storm doesn't repeat the line every event.
+_archive_warned = False
 
 
 def log(msg):
@@ -455,6 +469,82 @@ def event_grab(key):
         log(f"event grab {key}: no frame")
 
 
+def is_person(data):
+    """True if a wyze_camera_event payload classifies as a person detection.
+
+    The Cam Plus AI object class rides in tag_list as integer codes (101=Person;
+    memory wyze-event-tag-list-mapping); a named ai_tag_list ('person') may also
+    appear on Cam-Plus accounts. Compare as strings so an int 101 or a str "101"
+    both match.
+    """
+    tags = [str(t) for t in (data.get("tag_list") or [])]
+    ai = [str(x).lower() for x in (data.get("ai_tag_list") or [])]
+    return (PERSON_TAG in tags) or ("person" in ai)
+
+
+def prune_archive(dstdir):
+    """Remove archived *.jpg older than ARCHIVE_RETENTION_DAYS by mtime.
+
+    Best-effort: any error is logged and swallowed so a prune failure can never
+    kill the event listener.
+    """
+    try:
+        cutoff = time.time() - ARCHIVE_RETENTION_DAYS * 86400
+        removed = 0
+        for name in os.listdir(dstdir):
+            if not name.endswith(".jpg"):
+                continue
+            path = os.path.join(dstdir, name)
+            try:
+                if os.path.getmtime(path) < cutoff:
+                    os.remove(path)
+                    removed += 1
+            except FileNotFoundError:
+                pass
+        if removed:
+            log(f"porch archive: pruned {removed} still(s) older than "
+                f"{ARCHIVE_RETENTION_DAYS}d from {os.path.basename(dstdir)}/")
+    except Exception as exc:
+        log(f"porch archive prune error ({exc!r})")
+
+
+def archive_porch_still(key):
+    """Copy the current on-disk still for `key` into the dated archive.
+
+    Opt-in: when ARCHIVE_DIR is not a mounted dir the archive is disabled and we
+    log once then return, so the sidecar runs unchanged with no /archive bind.
+    The current OUT_DIR/<key>.jpg is copied (read bytes -> write .tmp ->
+    os.replace) to ARCHIVE_DIR/<key>/<UTC-timestamp>.jpg with microseconds in the
+    name to avoid same-second collisions, then the dir is pruned to retention.
+    """
+    global _archive_warned
+    if not os.path.isdir(ARCHIVE_DIR):
+        if not _archive_warned:
+            log(f"porch archive disabled (ARCHIVE_DIR {ARCHIVE_DIR} not a mounted dir)")
+            _archive_warned = True
+        return
+    src = os.path.join(OUT_DIR, f"{key}.jpg")
+    if not os.path.exists(src):
+        log(f"porch archive {key}: skip (no {src} yet)")
+        return
+    dstdir = os.path.join(ARCHIVE_DIR, key)
+    os.makedirs(dstdir, exist_ok=True)
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
+    dst = os.path.join(dstdir, f"{ts}.jpg")
+    tmp = f"{dst}.tmp"
+    try:
+        with open(src, "rb") as f:
+            jpeg = f.read()
+        with open(tmp, "wb") as f:
+            f.write(jpeg)
+        os.replace(tmp, dst)
+        log(f"porch archive wrote wyze/{key}/{ts}.jpg ({len(jpeg)} bytes)")
+    except Exception as exc:
+        log(f"porch archive {key} failed: {exc!r}")
+        return
+    prune_archive(dstdir)
+
+
 async def run_event_listener(stop):
     """Subscribe to HA's `wyze_camera_event` and grab a still per event.
 
@@ -503,6 +593,11 @@ async def run_event_listener(stop):
                     if not key:
                         continue
                     await loop.run_in_executor(None, event_grab, key)
+                    # Front-porch person archive (Hassio-5sa): on a PERSON event
+                    # for the porch cam, snapshot the current still to the ZFS
+                    # archive. Runs after the grab so it copies the freshest file.
+                    if key == PORCH_KEY and is_person(data):
+                        await loop.run_in_executor(None, archive_porch_still, key)
         except Exception as exc:
             if stop["flag"]:
                 break

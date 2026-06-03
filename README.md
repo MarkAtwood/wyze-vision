@@ -90,6 +90,35 @@ Details:
   has no go2rtc stream, so its event is skipped (logged) and picked up by the
   next cycle.
 
+## Front-porch person archive (Hassio-5sa, optional)
+The event listener also archives a **history of front-porch person sightings** to
+durable ZFS storage. When a `wyze_camera_event` for the porch cam (`PORCH_KEY`,
+default `front_door`) classifies as a **person** (`tag_list` contains `101`, or an
+`ai_tag_list` of `person`; see memory `wyze-event-tag-list-mapping`), the sidecar
+copies the **current** `/config/wyze_snapshots/front_door.jpg` to a timestamped
+file `<key>/<UTC-timestamp>.jpg` under `ARCHIVE_DIR`. Filenames carry microseconds
+to avoid same-second collisions. This rides on the existing event listener — **no
+new container, no second token, no `camera_proxy` fetch** (it copies the on-disk
+still the event grab just refreshed).
+
+- **Storage:** the proxmox ZFS dataset `tank/shared`, already NFS-exported
+  (`sharenfs rw=@10.69.40.0/21`, which covers this host) and mounted on `hassio`
+  at `/mnt/tank-shared` (fstab `10.69.42.12:/mnt/tank/shared … nfs _netdev,nofail,vers=4`).
+  `/mnt/tank-shared/wyze` is bind-mounted into the container at `/archive`, with a
+  subdir per real camera (20, created up front so it generalises; only
+  `front_door` is written in v1).
+- **Retention:** on each write, `front_door/` is pruned of `*.jpg` older than
+  `ARCHIVE_RETENTION_DAYS` (default 100) by mtime (best-effort; a prune error is
+  logged, never fatal).
+- **Opt-in:** active only when `ARCHIVE_DIR` (`/archive`) is a **mounted dir**.
+  With no NFS bind it logs `porch archive disabled` once and the sidecar runs
+  exactly as before.
+- **Bind-ordering caveat:** the NFS mount must be **up before** the container
+  starts — docker auto-creates an empty *local* `/mnt/tank-shared/wyze` if the
+  source is absent, and writes would silently land on local disk instead of the
+  ZFS. The fstab `_netdev` mount handles this across reboots; after a manual NFS
+  outage, `mount -a` then `docker compose up -d` before relying on the archive.
+
 ## Deploy (hassio VM)
 ```bash
 scp -r infra/hassio/wyze-snapshot/ hassio:~/homeassistant/wyze-snapshot/
