@@ -101,12 +101,32 @@ def build_source(cfg):
     return src
 
 
+def wyze_offline_since(cam):
+    """Cloud-authoritative epoch (seconds) a camera went offline, or None.
+
+    Wyze's device list carries conn_state (1=online, 0=offline) and
+    conn_state_ts (epoch MILLIseconds of the last connection-state change).
+    For an offline cam (conn_state==0) that transition time IS when it dropped
+    offline -- a real "offline since". Only trust it when the cloud also reports
+    the cam offline; if conn_state==1 the timestamp is the came-online time and
+    is meaningless as an offline date. (There is no `last_seen` field on the
+    camera device list -- it is always null; conn_state_ts is the equivalent.)
+    """
+    rd = getattr(cam, "raw_dict", None) or {}
+    if rd.get("conn_state") == 0:
+        cts = rd.get("conn_state_ts")
+        if cts:
+            return int(cts // 1000)
+    return None
+
+
 async def collect_streams():
     """Enumerate cameras into online streams and offline placeholders.
 
     Returns (streams, offline):
       streams  = {stream_key: go2rtc_source_line} for reachable (online) cams,
-      offline  = {stream_key: nickname} for cams reporting offline.
+      offline  = {stream_key: (nickname, since_epoch|None)} for offline cams,
+                 where since_epoch is the Wyze cloud offline-transition time.
     """
     access, refresh = load_tokens()
     auth = await WyzeAuthLib.create(token=Token(access, refresh, time.time() + 1e5))
@@ -130,13 +150,13 @@ async def collect_streams():
             # payload (transient KVS auth_token / AWS security token); never log
             # it. Only inspect it to classify offline vs other errors.
             if "offline" in str(exc).lower():
-                offline[key] = cam.nickname or key
+                offline[key] = (cam.nickname or key, wyze_offline_since(cam))
                 log(f"  offline {key}")
             else:
                 log(f"  skip {key}: get_stream_info error ({type(exc).__name__})")
             continue
         if not cfg or "signaling_url" not in cfg:
-            offline[key] = cam.nickname or key
+            offline[key] = (cam.nickname or key, wyze_offline_since(cam))
             log(f"  offline {key} (no signaling_url)")
             continue
         try:
@@ -285,14 +305,16 @@ def cycle(go2rtc):
         log("no online cameras this cycle")
 
     # Offline cameras: render an "offline since <date>" placeholder. The "since"
-    # date is the last time we saw the camera online, falling back to the first
-    # time we observed it offline (when it was never seen online).
+    # date prefers Wyze's cloud offline-transition time (conn_state_ts), which is
+    # accurate for cams that were offline long before this sidecar started. When
+    # the cloud timestamp is absent it falls back to the last time we saw the cam
+    # online, then to the first time we observed it offline.
     placeholders = 0
-    for key, nickname in offline.items():
+    for key, (nickname, wyze_since) in offline.items():
         prev = state.get(key, {})
         last_online = prev.get("last_online")
         offline_since = prev.get("offline_since") or now
-        since = last_online or offline_since
+        since = wyze_since or last_online or offline_since
         state[key] = {"last_online": last_online, "offline_since": offline_since}
         try:
             write_frame(key, render_offline(nickname, since))
