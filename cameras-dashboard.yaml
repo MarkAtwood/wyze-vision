@@ -14,121 +14,119 @@
 # still JPEG), blanking every tile. picture-glance feeds camera_image straight
 # to the image renderer, so the reliable still always shows. `entities: []` is
 # required by the picture-glance schema (empty list is valid).
+#
+# LAYOUT: a default (masonry) view with each picture-glance as a TOP-LEVEL card.
+# In masonry every card occupies one ~500px column and the cards auto-tile 3-4
+# across the full screen width, so each camera renders large and responsively.
+# Do NOT wrap these in a `type: grid` card: in masonry a single grid card is
+# confined to ONE ~500px column, so a `columns: 3` grid squeezes each tile down
+# to ~150px (the tiny-tile bug, Hassio-0gk). Online cams lead; offline cams
+# (dark "offline since" placeholder from the sidecar) follow.
 title: Cameras
 views:
   - title: Wyze
     path: wyze
     icon: mdi:cctv
     cards:
-      - type: markdown
-        content: "## Online"
-      - type: grid
-        columns: 3
-        square: false
-        cards:
-          - type: picture-glance
-            title: Front Door
-            entity: camera.front_door
-            camera_image: camera.wyze_front_door_snapshot
-            entities: []
-          - type: picture-glance
-            title: Garden
-            entity: camera.garden
-            camera_image: camera.wyze_garden_snapshot
-            entities: []
-          - type: picture-glance
-            title: Catio
-            entity: camera.catio
-            camera_image: camera.wyze_catio_snapshot
-            entities: []
-          - type: picture-glance
-            title: Studio
-            entity: camera.studio
-            camera_image: camera.wyze_studio_snapshot
-            entities: []
-          - type: picture-glance
-            title: Shop
-            entity: camera.shop
-            camera_image: camera.wyze_shop_snapshot
-            entities: []
-          - type: picture-glance
-            title: Toolbox
-            entity: camera.toolbox
-            camera_image: camera.wyze_toolbox_snapshot
-            entities: []
-          - type: picture-glance
-            title: Roundabout
-            entity: camera.roundabout
-            camera_image: camera.wyze_roundabout_snapshot
-            entities: []
-          - type: picture-glance
-            title: Cat Flap
-            entity: camera.cat_flap
-            camera_image: camera.wyze_cat_flap_snapshot
-            entities: []
-          - type: picture-glance
-            title: 3D Printer
-            entity: camera.3d_printer
-            camera_image: camera.wyze_3d_printer_snapshot
-            entities: []
-          - type: picture-glance
-            title: Garden Meadow
-            entity: camera.garden_meadow
-            camera_image: camera.wyze_garden_meadow_snapshot
-            entities: []
-          - type: picture-glance
-            title: Greenhouse North
-            entity: camera.greenhouse_north
-            camera_image: camera.wyze_greenhouse_north_snapshot
-            entities: []
-          - type: picture-glance
-            title: Outside Studio
-            entity: camera.outside_studio
-            camera_image: camera.wyze_outside_studio_snapshot
-            entities: []
-      - type: markdown
-        content: "## Offline"
-      - type: grid
-        columns: 3
-        square: false
-        cards:
-          - type: picture-glance
-            title: Tammy
-            entity: camera.tammy
-            camera_image: camera.wyze_tammy_snapshot
-            entities: []
-          - type: picture-glance
-            title: TBD
-            entity: camera.tbd
-            camera_image: camera.wyze_tbd_snapshot
-            entities: []
-          - type: picture-glance
-            title: Back Yard Cam
-            entity: camera.back_yard_cam
-            camera_image: camera.wyze_back_yard_cam_snapshot
-            entities: []
-          - type: picture-glance
-            title: Sprouting Shed 1
-            entity: camera.sprouting_shed_1
-            camera_image: camera.wyze_sprouting_shed_1_snapshot
-            entities: []
-          - type: picture-glance
-            title: Sprouting Shed 2
-            entity: camera.sprouting_shed_2
-            camera_image: camera.wyze_sprouting_shed_2_snapshot
-            entities: []
-          - type: picture-glance
-            title: Garden Pan
-            entity: camera.garden_pan
-            camera_image: camera.wyze_garden_pan_snapshot
-            entities: []
-          - type: picture-glance
-            title: Greenhouse
-            entity: camera.greenhouse
-            camera_image: camera.wyze_greenhouse_snapshot
-            entities: []
-          - type: picture-glance
-            title: Back Greenhouse
-            entity: camera.back_greenhouse
-            camera_image: camera.wyze_back_greenhouse_snapshot
-            entities: []
+      # --- Online ---
+      - type: picture-glance
+        title: Front Door
+        entity: camera.front_door
+        camera_image: camera.wyze_front_door_snapshot
+        entities: []
+      - type: picture-glance
+        title: Garden
+        entity: camera.garden
+        camera_image: camera.wyze_garden_snapshot
+        entities: []
+      - type: picture-glance
+        title: Catio
+        entity: camera.catio
+        camera_image: camera.wyze_catio_snapshot
+        entities: []
+      - type: picture-glance
+        title: Studio
+        entity: camera.studio
+        camera_image: camera.wyze_studio_snapshot
+        entities: []
+      - type: picture-glance
+        title: Shop
+        entity: camera.shop
+        camera_image: camera.wyze_shop_snapshot
+        entities: []
+      - type: picture-glance
+        title: Toolbox
+        entity: camera.toolbox
+        camera_image: camera.wyze_toolbox_snapshot
+        entities: []
+      - type: picture-glance
+        title: Roundabout
+        entity: camera.roundabout
+        camera_image: camera.wyze_roundabout_snapshot
+        entities: []
+      - type: picture-glance
+        title: Cat Flap
+        entity: camera.cat_flap
+        camera_image: camera.wyze_cat_flap_snapshot
+        entities: []
+      - type: picture-glance
+        title: 3D Printer
+        entity: camera.3d_printer
+        camera_image: camera.wyze_3d_printer_snapshot
+        entities: []
+      - type: picture-glance
+        title: Garden Meadow
+        entity: camera.garden_meadow
+        camera_image: camera.wyze_garden_meadow_snapshot
+        entities: []
+      - type: picture-glance
+        title: Greenhouse North
+        entity: camera.greenhouse_north
+        camera_image: camera.wyze_greenhouse_north_snapshot
+        entities: []
+      - type: picture-glance
+        title: Outside Studio
+        entity: camera.outside_studio
+        camera_image: camera.wyze_outside_studio_snapshot
+        entities: []
+      # --- Offline ---
+      - type: picture-glance
+        title: Tammy
+        entity: camera.tammy
+        camera_image: camera.wyze_tammy_snapshot
+        entities: []
+      - type: picture-glance
+        title: TBD
+        entity: camera.tbd
+        camera_image: camera.wyze_tbd_snapshot
+        entities: []
+      - type: picture-glance
+        title: Back Yard Cam
+        entity: camera.back_yard_cam
+        camera_image: camera.wyze_back_yard_cam_snapshot
+        entities: []
+      - type: picture-glance
+        title: Sprouting Shed 1
+        entity: camera.sprouting_shed_1
+        camera_image: camera.wyze_sprouting_shed_1_snapshot
+        entities: []
+      - type: picture-glance
+        title: Sprouting Shed 2
+        entity: camera.sprouting_shed_2
+        camera_image: camera.wyze_sprouting_shed_2_snapshot
+        entities: []
+      - type: picture-glance
+        title: Garden Pan
+        entity: camera.garden_pan
+        camera_image: camera.wyze_garden_pan_snapshot
+        entities: []
+      - type: picture-glance
+        title: Greenhouse
+        entity: camera.greenhouse
+        camera_image: camera.wyze_greenhouse_snapshot
+        entities: []
+      - type: picture-glance
+        title: Back Greenhouse
+        entity: camera.back_greenhouse
+        camera_image: camera.wyze_back_greenhouse_snapshot
+        entities: []
