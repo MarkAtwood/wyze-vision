@@ -28,6 +28,19 @@ views:
     path: wyze
     icon: mdi:cctv
     cards:
+      # --- Event log ---
+      # Rolling human-readable log of the last 15 Wyze camera events, fed by
+      # sensor.wyze_event_log (ha-packages/wyze_event_log.yaml). relative_time()
+      # renders each `ts` as "x ago" so the card stays current as it auto-refreshes.
+      - type: markdown
+        title: Wyze Event Log
+        content: >
+          {% set rows = state_attr('sensor.wyze_event_log', 'entries') or [] %}
+          {% set ns = namespace(lines=[]) %}
+          {% for e in rows %}
+          {% set ns.lines = ns.lines + ['**' ~ e.cam ~ '** &middot; ' ~ e.label ~ ' &middot; ' ~ relative_time(as_datetime(e.ts)) ~ ' ago'] %}
+          {% endfor %}
+          {{ ns.lines | join('\n\n') if ns.lines else '_No Wyze events recorded yet._' }}
       # --- Online ---
       - type: picture-glance
         title: Front Door
