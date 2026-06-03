@@ -77,15 +77,59 @@ EVENT_TYPE = os.environ.get("EVENT_TYPE", "wyze_camera_event")
 # burst). The periodic cycle is unaffected.
 EVENT_MIN_INTERVAL = int(os.environ.get("EVENT_MIN_INTERVAL", "15"))
 
-# Optional front-porch person archive (Hassio-5sa): on a PERSON event
-# (tag_list contains 101) for the front porch (stream_key PORCH_KEY), copy the
-# current on-disk still to a timestamped file under ARCHIVE_DIR/<key>/, pruned
-# to ARCHIVE_RETENTION_DAYS. Opt-in: active only when ARCHIVE_DIR is a mounted
-# dir (a bind mount of the NFS ZFS share); absent -> the sidecar runs unchanged.
+# Optional event-still archive (Hassio-5sa / -bp8 / -ud0): on a matching
+# wyze_camera_event, copy the current on-disk still to a timestamped file under
+# ARCHIVE_DIR/<key>/, pruned to ARCHIVE_RETENTION_DAYS. Which cameras + event
+# types to archive is data-driven via ARCHIVE_RULES (edit the docker-compose env,
+# no code change). Per-cam subdirs are created on first write, so adding or
+# renaming a camera needs no manual mkdir.
 ARCHIVE_DIR = os.environ.get("ARCHIVE_DIR", "/archive")
-PORCH_KEY = os.environ.get("PORCH_KEY", "front_door")
-PERSON_TAG = os.environ.get("PERSON_TAG", "101")
+# Sentinel proving ARCHIVE_DIR is the real mounted ZFS share, not a docker-made
+# empty LOCAL bind dir from an NFS outage. Create it once on the share itself:
+#   touch /mnt/tank/shared/wyze/.archive_root
+# Missing marker -> archive disables (logs once) instead of writing to local disk.
+ARCHIVE_MARKER = os.environ.get("ARCHIVE_MARKER", ".archive_root")
 ARCHIVE_RETENTION_DAYS = int(os.environ.get("ARCHIVE_RETENTION_DAYS", "100"))
+
+# Named AI event labels -> the integer tag_list codes Wyze emits (memory
+# wyze-event-tag-list-mapping); ai_tag_list carries the same names. Used to match
+# an event against the labels listed for a camera in ARCHIVE_RULES.
+ARCHIVE_TAG_CODES = {
+    "person": "101",
+    "pet": "102",
+    "vehicle": "103",
+    "package": "104",
+}
+
+
+def _load_archive_rules():
+    """Parse ARCHIVE_RULES JSON {stream_key: [label, ...]} from the env.
+
+    Labels are lowercased. A bad/missing value disables the archive (empty dict)
+    rather than crashing the sidecar. Default preserves the original behavior:
+    archive front_door person events.
+    """
+    raw = os.environ.get("ARCHIVE_RULES", '{"front_door": ["person"]}')
+    try:
+        # json.loads raises ValueError on bad JSON; .items() raises AttributeError
+        # if the top level parsed to a non-dict (e.g. a JSON list/number). Both are
+        # caught below so a fat-fingered env can never crash the sidecar at import.
+        parsed = json.loads(raw)
+        # Normalise every label to lowercase so rule-matching (event_labels) is
+        # case-insensitive; `labels or []` tolerates a null value for a key.
+        return {
+            key: [str(lbl).lower() for lbl in (labels or [])]
+            for key, labels in parsed.items()
+        }
+    except (ValueError, AttributeError) as exc:
+        # Empty dict => should_archive() always returns False => archive off.
+        # print() not log(): log() is defined later in the file, but this runs at
+        # import time (ARCHIVE_RULES = _load_archive_rules() below).
+        print(f"[archive] bad ARCHIVE_RULES ({exc!r}); archive disabled", flush=True)
+        return {}
+
+
+ARCHIVE_RULES = _load_archive_rules()
 
 # --- shared state between the periodic cycle and the event listener ----------
 # Serialises go2rtc.restart() (in cycle()) against an event_grab()'s fetch_frame
@@ -97,8 +141,10 @@ _go2rtc_lock = threading.Lock()
 current_streams = set()
 # key -> monotonic time of the last successful/attempted event grab, for debounce.
 _last_grab = {}
-# Set once we've logged that the porch archive is disabled (no /archive mount),
-# so an event storm doesn't repeat the line every event.
+# Latch: True once we've logged that the archive is disabled (sentinel marker
+# missing), so an event storm doesn't repeat the line every event. Reset to False
+# by archive_event_still() the moment the marker reappears, so a later outage logs
+# again. See archive_event_still() for the marker-guard logic.
 _archive_warned = False
 
 
@@ -469,17 +515,50 @@ def event_grab(key):
         log(f"event grab {key}: no frame")
 
 
-def is_person(data):
-    """True if a wyze_camera_event payload classifies as a person detection.
+def event_labels(data):
+    """Set of archive labels a wyze_camera_event payload matches.
 
-    The Cam Plus AI object class rides in tag_list as integer codes (101=Person;
-    memory wyze-event-tag-list-mapping); a named ai_tag_list ('person') may also
-    appear on Cam-Plus accounts. Compare as strings so an int 101 or a str "101"
-    both match.
+    The Cam Plus AI object class rides in tag_list as integer codes (101=Person,
+    memory wyze-event-tag-list-mapping) and/or as named strings in ai_tag_list.
+    Returns the lowercased label names (person/pet/vehicle/package) present, by
+    matching both the named ai_tag_list and the ARCHIVE_TAG_CODES-mapped tag_list.
     """
-    tags = [str(t) for t in (data.get("tag_list") or [])]
-    ai = [str(x).lower() for x in (data.get("ai_tag_list") or [])]
-    return (PERSON_TAG in tags) or ("person" in ai)
+    # Two parallel signals from the payload, normalised to string sets so we can do
+    # set membership below regardless of how Wyze typed them:
+    #   tag_list   -> integer codes, stringified ("101")     -> compare vs code
+    #   ai_tag_list-> names, lowercased ("person")           -> compare vs label
+    # `or []` guards a missing/null field (not every event carries both).
+    tags = {str(t) for t in (data.get("tag_list") or [])}
+    ai = {str(x).lower() for x in (data.get("ai_tag_list") or [])}
+    # A label is "present" if EITHER signal names it: its mapped code is in tag_list
+    # OR its name is in ai_tag_list. Belt-and-suspenders since cams differ in which
+    # of the two they populate.
+    return {
+        label
+        for label, code in ARCHIVE_TAG_CODES.items()
+        if code in tags or label in ai
+    }
+
+
+def should_archive(key, data):
+    """True if `key` is configured in ARCHIVE_RULES and the event matches.
+
+    A rule list of ['any'] (or '*') archives every event for that camera;
+    otherwise the event must carry one of the configured labels.
+    """
+    # wanted = the label list configured for this cam, or None if the cam isn't in
+    # ARCHIVE_RULES at all. `not wanted` covers both the absent key and an empty
+    # list -> nothing to archive for this cam, bail before touching the payload.
+    wanted = ARCHIVE_RULES.get(key)
+    if not wanted:
+        return False
+    # Wildcard: archive EVERY event for this cam regardless of class. Lets you
+    # configure a cam with ["any"] in the env without enumerating labels.
+    if "any" in wanted or "*" in wanted:
+        return True
+    # Otherwise the event must carry at least one of the configured labels:
+    # non-empty set intersection between what the event matched and what we want.
+    return bool(event_labels(data) & set(wanted))
 
 
 def prune_archive(dstdir):
@@ -489,9 +568,14 @@ def prune_archive(dstdir):
     kill the event listener.
     """
     try:
+        # Everything with mtime before this wall-clock instant is too old. mtime
+        # (not the filename timestamp) is the source of truth so a clock skew or a
+        # manually-copied file is still pruned sanely.
         cutoff = time.time() - ARCHIVE_RETENTION_DAYS * 86400
         removed = 0
         for name in os.listdir(dstdir):
+            # Only our own JPEGs; never touch the .archive_root marker (it lives one
+            # level up in ARCHIVE_DIR, not here) or any stray non-jpg.
             if not name.endswith(".jpg"):
                 continue
             path = os.path.join(dstdir, name)
@@ -500,48 +584,77 @@ def prune_archive(dstdir):
                     os.remove(path)
                     removed += 1
             except FileNotFoundError:
+                # Raced with another writer/pruner; the file is already gone, which
+                # is the outcome we wanted anyway -> ignore.
                 pass
         if removed:
-            log(f"porch archive: pruned {removed} still(s) older than "
+            log(f"archive: pruned {removed} still(s) older than "
                 f"{ARCHIVE_RETENTION_DAYS}d from {os.path.basename(dstdir)}/")
     except Exception as exc:
-        log(f"porch archive prune error ({exc!r})")
+        # Broad catch by design: a prune failure (NFS hiccup, perms) must never
+        # propagate and kill the event listener. Log and move on.
+        log(f"archive prune error ({exc!r})")
 
 
-def archive_porch_still(key):
+def archive_event_still(key):
     """Copy the current on-disk still for `key` into the dated archive.
 
-    Opt-in: when ARCHIVE_DIR is not a mounted dir the archive is disabled and we
-    log once then return, so the sidecar runs unchanged with no /archive bind.
-    The current OUT_DIR/<key>.jpg is copied (read bytes -> write .tmp ->
-    os.replace) to ARCHIVE_DIR/<key>/<UTC-timestamp>.jpg with microseconds in the
-    name to avoid same-second collisions, then the dir is pruned to retention.
+    Opt-in + NFS-safe: the archive is active only when the sentinel ARCHIVE_MARKER
+    file exists inside ARCHIVE_DIR. That marker lives on the real ZFS share, so a
+    docker-auto-created empty LOCAL bind dir (NFS down) lacks it and the archive
+    disables (logs once) rather than silently writing to local disk; the marker
+    reappearing re-arms the warning. The per-cam subdir is created on first write,
+    so a newly added/renamed camera needs no manual mkdir. The current
+    OUT_DIR/<key>.jpg is copied (read bytes -> write .tmp -> os.replace) to
+    ARCHIVE_DIR/<key>/<UTC-timestamp>.jpg with microseconds in the name to avoid
+    same-second collisions, then the dir is pruned to retention.
     """
     global _archive_warned
-    if not os.path.isdir(ARCHIVE_DIR):
+    # --- NFS-safe sentinel guard (req #1) -----------------------------------
+    # The marker is a file we created ON the ZFS share. If the NFS mount is down,
+    # docker has auto-created an empty LOCAL bind dir that does NOT contain it, so
+    # isfile() is False and we refuse to write (which would silently land on local
+    # disk). Latch the warning so an event storm logs it once; clear the latch the
+    # instant the marker is back so a future outage warns again.
+    marker = os.path.join(ARCHIVE_DIR, ARCHIVE_MARKER)
+    if not os.path.isfile(marker):
         if not _archive_warned:
-            log(f"porch archive disabled (ARCHIVE_DIR {ARCHIVE_DIR} not a mounted dir)")
+            log(f"archive disabled (marker {marker} missing; NFS down or unmounted?)")
             _archive_warned = True
         return
+    _archive_warned = False
+    # Source is the still the periodic cycle / event_grab just wrote. If it doesn't
+    # exist yet (cam never produced a frame this run) there's nothing to copy.
     src = os.path.join(OUT_DIR, f"{key}.jpg")
     if not os.path.exists(src):
-        log(f"porch archive {key}: skip (no {src} yet)")
+        log(f"archive {key}: skip (no {src} yet)")
         return
+    # --- per-cam subdir, auto-created (req #2) ------------------------------
+    # No pre-created dirs: makedirs(exist_ok=True) is a no-op once it exists and
+    # creates it on first write, so a newly added/renamed cam (new stream_key)
+    # just starts archiving with no manual mkdir.
     dstdir = os.path.join(ARCHIVE_DIR, key)
     os.makedirs(dstdir, exist_ok=True)
+    # UTC + microseconds: sortable, tz-unambiguous, and collision-proof if two
+    # events for one cam land in the same second.
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
     dst = os.path.join(dstdir, f"{ts}.jpg")
     tmp = f"{dst}.tmp"
     try:
+        # Read whole JPEG, write to a .tmp, then os.replace -> atomic rename. A
+        # reader (or a backup walking the tree) never sees a half-written .jpg.
         with open(src, "rb") as f:
             jpeg = f.read()
         with open(tmp, "wb") as f:
             f.write(jpeg)
         os.replace(tmp, dst)
-        log(f"porch archive wrote wyze/{key}/{ts}.jpg ({len(jpeg)} bytes)")
+        log(f"archive wrote wyze/{key}/{ts}.jpg ({len(jpeg)} bytes)")
     except Exception as exc:
-        log(f"porch archive {key} failed: {exc!r}")
+        # Don't let an I/O error (NFS stall mid-write, full disk) kill the listener.
+        # The orphaned .tmp, if any, is harmless and overwritten next time.
+        log(f"archive {key} failed: {exc!r}")
         return
+    # Enforce retention on this cam's dir after every successful write.
     prune_archive(dstdir)
 
 
@@ -593,11 +706,11 @@ async def run_event_listener(stop):
                     if not key:
                         continue
                     await loop.run_in_executor(None, event_grab, key)
-                    # Front-porch person archive (Hassio-5sa): on a PERSON event
-                    # for the porch cam, snapshot the current still to the ZFS
+                    # Event-still archive (Hassio-5sa / -bp8): if this cam + event
+                    # match ARCHIVE_RULES, snapshot the current still to the ZFS
                     # archive. Runs after the grab so it copies the freshest file.
-                    if key == PORCH_KEY and is_person(data):
-                        await loop.run_in_executor(None, archive_porch_still, key)
+                    if should_archive(key, data):
+                        await loop.run_in_executor(None, archive_event_still, key)
         except Exception as exc:
             if stop["flag"]:
                 break

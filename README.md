@@ -90,34 +90,46 @@ Details:
   has no go2rtc stream, so its event is skipped (logged) and picked up by the
   next cycle.
 
-## Front-porch person archive (Hassio-5sa, optional)
-The event listener also archives a **history of front-porch person sightings** to
-durable ZFS storage. When a `wyze_camera_event` for the porch cam (`PORCH_KEY`,
-default `front_door`) classifies as a **person** (`tag_list` contains `101`, or an
-`ai_tag_list` of `person`; see memory `wyze-event-tag-list-mapping`), the sidecar
-copies the **current** `/config/wyze_snapshots/front_door.jpg` to a timestamped
-file `<key>/<UTC-timestamp>.jpg` under `ARCHIVE_DIR`. Filenames carry microseconds
-to avoid same-second collisions. This rides on the existing event listener — **no
-new container, no second token, no `camera_proxy` fetch** (it copies the on-disk
-still the event grab just refreshed).
+## Event-still archive (Hassio-5sa / -bp8 / -ud0, optional)
+The event listener also archives a **history of selected camera events** to durable
+ZFS storage. When a `wyze_camera_event` arrives, the sidecar consults `ARCHIVE_RULES`
+(JSON `{stream_key: [label, …]}`); if the cam is listed and the event matches a
+wanted label, it copies the **current** `/config/wyze_snapshots/<key>.jpg` to a
+timestamped file `<key>/<UTC-timestamp>.jpg` under `ARCHIVE_DIR`. Filenames carry
+microseconds to avoid same-second collisions. This rides on the existing event
+listener — **no new container, no second token, no `camera_proxy` fetch** (it copies
+the on-disk still the event grab just refreshed).
 
+- **Configurable cams + event types (req #3):** `ARCHIVE_RULES` is JSON
+  `{stream_key: [label, …]}`. Labels are `person`/`pet`/`vehicle`/`package` (mapped
+  to `tag_list` codes 101/102/103/104, or matched against `ai_tag_list` names; see
+  memory `wyze-event-tag-list-mapping`), or `"any"`/`"*"` for **every** event on that
+  cam. Default `{"front_door": ["person"]}`. Edit the env in `docker-compose.yml` to
+  add/change archived cams or event types — **no code change**. A malformed
+  `ARCHIVE_RULES` logs once and disables the archive (fail-safe).
+- **Auto-created subdirs (req #2):** there are **no pre-created dirs**. The per-cam
+  subdir `<ARCHIVE_DIR>/<key>/` is created on first write via
+  `os.makedirs(…, exist_ok=True)`, so adding or renaming a camera (new `stream_key`)
+  just works the next time it fires a matching event.
+- **NFS-safe sentinel guard (req #1):** the archive is active only when the marker
+  file `ARCHIVE_MARKER` (default `.archive_root`) exists **inside** `ARCHIVE_DIR`.
+  Create it once on the ZFS: `touch /mnt/tank/shared/wyze/.archive_root`. If the NFS
+  mount is down, docker auto-creates an empty *local* `/mnt/tank-shared/wyze` that
+  **lacks** the marker, so the archive disables (logs once, re-arms when the marker
+  returns) and stills never land on local disk. This replaces the old bare
+  `isdir()` opt-in.
 - **Storage:** the proxmox ZFS dataset `tank/shared`, already NFS-exported
   (`sharenfs rw=@10.69.40.0/21`, which covers this host) and mounted on `hassio`
   at `/mnt/tank-shared` (fstab `10.69.42.12:/mnt/tank/shared … nfs _netdev,nofail,vers=4`).
-  `/mnt/tank-shared/wyze` is bind-mounted into the container at `/archive`, with a
-  subdir per real camera (20, created up front so it generalises; only
-  `front_door` is written in v1).
-- **Retention:** on each write, `front_door/` is pruned of `*.jpg` older than
+  `/mnt/tank-shared/wyze` is bind-mounted into the container at `/archive`.
+- **Retention:** on each write, that cam's `<key>/` is pruned of `*.jpg` older than
   `ARCHIVE_RETENTION_DAYS` (default 100) by mtime (best-effort; a prune error is
   logged, never fatal).
-- **Opt-in:** active only when `ARCHIVE_DIR` (`/archive`) is a **mounted dir**.
-  With no NFS bind it logs `porch archive disabled` once and the sidecar runs
-  exactly as before.
 - **Bind-ordering caveat:** the NFS mount must be **up before** the container
   starts — docker auto-creates an empty *local* `/mnt/tank-shared/wyze` if the
-  source is absent, and writes would silently land on local disk instead of the
-  ZFS. The fstab `_netdev` mount handles this across reboots; after a manual NFS
-  outage, `mount -a` then `docker compose up -d` before relying on the archive.
+  source is absent. The marker guard above keeps writes off local disk, but to
+  actually archive you still need the mount: the fstab `_netdev` mount handles this
+  across reboots; after a manual NFS outage, `mount -a` then `docker compose up -d`.
 
 ## Deploy (hassio VM)
 ```bash

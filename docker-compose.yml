@@ -39,10 +39,17 @@ services:
       - HA_URL=ws://127.0.0.1:8123/api/websocket
       - HA_TOKEN=${HA_TOKEN:-}
       - EVENT_MIN_INTERVAL=15
-      # Front-porch person archive (Hassio-5sa). Active only when /archive is a
-      # mounted dir (the NFS bind above); reuses the HA_TOKEN listener above.
+      # Event-still archive (Hassio-5sa / -bp8 / -ud0). Reuses the HA_TOKEN
+      # listener above. Active only when the sentinel ARCHIVE_MARKER file exists
+      # inside /archive (created once on the ZFS: `touch
+      # /mnt/tank/shared/wyze/.archive_root`); if the NFS mount is down docker
+      # auto-creates an empty LOCAL /archive without the marker and the archive
+      # disables, so stills never land on local disk. ARCHIVE_RULES is JSON
+      # {stream_key: [label, ...]} (labels: person/pet/vehicle/package, or "any"
+      # for every event) -- edit here to add/change archived cams or event types,
+      # no code change. Per-cam subdirs are auto-created on first write.
       - ARCHIVE_DIR=/archive
-      - PORCH_KEY=front_door
-      - PERSON_TAG=101
+      - ARCHIVE_MARKER=.archive_root
+      - 'ARCHIVE_RULES={"front_door": ["person"]}'
       - ARCHIVE_RETENTION_DAYS=100
     restart: unless-stopped
