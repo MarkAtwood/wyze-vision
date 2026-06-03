@@ -25,6 +25,7 @@ import re
 import signal
 import subprocess
 import sys
+import threading
 import time
 
 import requests
@@ -62,6 +63,29 @@ MQTT_HOST = os.environ.get("MQTT_HOST", "")
 MQTT_PORT = int(os.environ.get("MQTT_PORT", "1883"))
 MQTT_USER = os.environ.get("MQTT_USER", "")
 MQTT_PASS = os.environ.get("MQTT_PASS", "")
+
+# Optional event-driven fast path (Hassio-i0w): subscribe to HA's
+# `wyze_camera_event` bus event and grab a fresh still for that single camera
+# the moment it fires, instead of waiting up to REFRESH_SECONDS for the next
+# periodic cycle. Opt-in: the listener thread starts only when HA_TOKEN is set,
+# so this sidecar stays secretless by default (same pattern as the MQTT bridge).
+HA_URL = os.environ.get("HA_URL", "ws://127.0.0.1:8123/api/websocket")
+HA_TOKEN = os.environ.get("HA_TOKEN", "")
+EVENT_TYPE = os.environ.get("EVENT_TYPE", "wyze_camera_event")
+# Minimum seconds between event grabs for the SAME camera (debounce a motion
+# burst). The periodic cycle is unaffected.
+EVENT_MIN_INTERVAL = int(os.environ.get("EVENT_MIN_INTERVAL", "15"))
+
+# --- shared state between the periodic cycle and the event listener ----------
+# Serialises go2rtc.restart() (in cycle()) against an event_grab()'s fetch_frame
+# so an on-event grab never races a config swap / process restart.
+_go2rtc_lock = threading.Lock()
+# Stream keys with a live go2rtc source as of the last periodic cycle. Reassigned
+# (atomic ref swap) each cycle right after write_yaml(); read by event_grab() to
+# skip cams that have no stream (offline at the last cycle -> next cycle picks up).
+current_streams = set()
+# key -> monotonic time of the last successful/attempted event grab, for debounce.
+_last_grab = {}
 
 
 def log(msg):
@@ -360,7 +384,12 @@ def cycle(go2rtc, publisher):
     ok = 0
     if streams:
         write_yaml(streams)
-        go2rtc.restart()
+        # Publish the live stream set for the event listener (atomic ref swap),
+        # then restart go2rtc under the lock so an event grab can't race it.
+        global current_streams
+        current_streams = set(streams)
+        with _go2rtc_lock:
+            go2rtc.restart()
         time.sleep(GO2RTC_SETTLE)
         for key in streams:
             jpeg = fetch_frame(key)
@@ -397,6 +426,95 @@ def cycle(go2rtc, publisher):
     )
 
 
+def event_grab(key):
+    """Grab a single fresh frame for `key` in response to a camera event.
+
+    Runs on the event listener's executor thread (blocking). Steps:
+      1. debounce -- skip if we grabbed this key < EVENT_MIN_INTERVAL ago;
+      2. membership -- skip+log if the cam had no live stream at the last cycle
+         (offline then -> no go2rtc source; the next periodic cycle picks it up);
+      3. fetch one frame under _go2rtc_lock (serialised against go2rtc.restart()).
+    Writes ONLY the JPEG, not .offline_state.json -- the periodic cycle owns that
+    bookkeeping and the offline date prefers the cloud-authoritative conn_state_ts.
+    """
+    now = time.monotonic()
+    last = _last_grab.get(key, 0)
+    if now - last < EVENT_MIN_INTERVAL:
+        log(f"event grab {key}: debounced ({now - last:.0f}s < {EVENT_MIN_INTERVAL}s)")
+        return
+    if key not in current_streams:
+        log(f"event grab {key}: skipped (no live stream this cycle)")
+        return
+    _last_grab[key] = now
+    with _go2rtc_lock:
+        jpeg = fetch_frame(key)
+    if jpeg:
+        write_frame(key, jpeg)
+        log(f"event grab {key}: wrote {key}.jpg ({len(jpeg)} bytes)")
+    else:
+        log(f"event grab {key}: no frame")
+
+
+async def run_event_listener(stop):
+    """Subscribe to HA's `wyze_camera_event` and grab a still per event.
+
+    Mirrors wyze-event-catalog/watcher.py's websocket handshake. On each event
+    it maps device_name -> stream_key and runs the blocking event_grab on the
+    default executor so the websocket stays responsive to ping/pong and stop.
+    Reconnects with exponential backoff 1->60s. Started only when HA_TOKEN is set.
+    """
+    import websockets
+
+    loop = asyncio.get_running_loop()
+    backoff = 1
+    while not stop["flag"]:
+        try:
+            async with websockets.connect(
+                HA_URL, max_size=None, ping_interval=20
+            ) as ws:
+                msg = json.loads(await ws.recv())
+                if msg.get("type") != "auth_required":
+                    raise RuntimeError(f"unexpected first frame: {msg}")
+                await ws.send(json.dumps({"type": "auth", "access_token": HA_TOKEN}))
+                msg = json.loads(await ws.recv())
+                if msg.get("type") != "auth_ok":
+                    raise RuntimeError(f"auth failed: {msg}")
+                log("event listener: authenticated")
+
+                await ws.send(json.dumps({
+                    "id": 1, "type": "subscribe_events", "event_type": EVENT_TYPE,
+                }))
+                msg = json.loads(await ws.recv())
+                if not msg.get("success"):
+                    raise RuntimeError(f"subscribe failed: {msg}")
+                log(f"event listener: subscribed to '{EVENT_TYPE}'")
+                backoff = 1
+
+                while not stop["flag"]:
+                    try:
+                        raw = await asyncio.wait_for(ws.recv(), timeout=30)
+                    except asyncio.TimeoutError:
+                        continue  # stay responsive to stop["flag"]
+                    msg = json.loads(raw)
+                    if msg.get("type") != "event":
+                        continue
+                    data = msg.get("event", {}).get("data", {})
+                    key = stream_key(data.get("device_name"))
+                    if not key:
+                        continue
+                    await loop.run_in_executor(None, event_grab, key)
+        except Exception as exc:
+            if stop["flag"]:
+                break
+            log(f"event listener: connection error ({exc}); retry in {backoff}s")
+            for _ in range(backoff):
+                if stop["flag"]:
+                    break
+                await asyncio.sleep(1)
+            backoff = min(backoff * 2, 60)
+    log("event listener: stopped")
+
+
 def main():
     os.makedirs(OUT_DIR, exist_ok=True)
     go2rtc = Go2rtc()
@@ -409,6 +527,15 @@ def main():
 
     signal.signal(signal.SIGTERM, handle)
     signal.signal(signal.SIGINT, handle)
+
+    # Event-driven fast path (Hassio-i0w): opt-in via HA_TOKEN. The daemon thread
+    # shares `stop` and dies on process exit (SIGTERM/SIGINT set stop["flag"]).
+    if HA_TOKEN:
+        threading.Thread(
+            target=lambda: asyncio.run(run_event_listener(stop)), daemon=True
+        ).start()
+    else:
+        log("event listener disabled (HA_TOKEN not set)")
 
     log(f"wyze-snapshot starting (refresh={REFRESH_SECONDS}s, out={OUT_DIR})")
     try:

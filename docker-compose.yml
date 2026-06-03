@@ -24,4 +24,12 @@ services:
       - MQTT_PORT=1883
       - MQTT_USER=wyzesnap
       - MQTT_PASS=${MQTT_PASS:-}
+      # Optional event-driven fast path (Hassio-i0w): on a wyze_camera_event,
+      # grab a fresh still for that one camera immediately instead of waiting for
+      # the next periodic cycle. HA_URL is non-secret; HA_TOKEN (an HA LLAT named
+      # 'wyze-snapshot') comes from the gitignored .env. With no .env the token is
+      # empty and the listener disables itself, so this sidecar stays secretless.
+      - HA_URL=ws://127.0.0.1:8123/api/websocket
+      - HA_TOKEN=${HA_TOKEN:-}
+      - EVENT_MIN_INTERVAL=15
     restart: unless-stopped

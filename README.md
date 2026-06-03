@@ -64,6 +64,32 @@ Keychain svc `mqtt-wyzesnap-password`, mirrored to the inventory Secrets/API Key
 tabs). Note the `dokr` broker has no `acl_file`, so the publish-only restriction
 is by convention (separate credential), not broker-enforced.
 
+## Event-driven refresh (Hassio-i0w, optional)
+The periodic cycle is the baseline refresher, but a tile can be up to
+`REFRESH_SECONDS` (600s) stale. When `HA_TOKEN` is set, the sidecar also runs a
+websocket listener thread that subscribes to HA's `wyze_camera_event` bus event
+(fired by `ha-wyzeapi` on every motion / Cam Plus AI detection) and grabs a
+**fresh still for that one camera immediately**, off the 600s grid.
+
+No go2rtc restart or KVS re-mint is needed: go2rtc runs **continuously** between
+cycles with the last cycle's source lines, and the cycle period (600s) is well
+under the KVS `X-Amz-Expires` (1800s), so any camera online at the last cycle
+still has a valid stream. An event grab is just one `frame.jpeg` fetch against
+the already-running go2rtc, serialised against the cycle's go2rtc restart by a
+lock and run on an executor so it never stalls the websocket.
+
+Details:
+- **Opt-in / secretless default:** the listener starts only when `HA_TOKEN` is
+  set (an HA long-lived access token named `wyze-snapshot`). Unset ⇒ logs
+  `event listener disabled` and behaves exactly as before (timer only).
+- **Debounce:** at most one grab per camera per `EVENT_MIN_INTERVAL` (default
+  15s), so a motion burst doesn't hammer go2rtc.
+- **State file untouched:** event grabs write **only** the JPEG, never
+  `.offline_state.json` — the periodic cycle owns that bookkeeping.
+- **Limitation (v1):** a camera that was **offline** at the last periodic cycle
+  has no go2rtc stream, so its event is skipped (logged) and picked up by the
+  next cycle.
+
 ## Deploy (hassio VM)
 ```bash
 scp -r infra/hassio/wyze-snapshot/ hassio:~/homeassistant/wyze-snapshot/
@@ -73,7 +99,8 @@ ssh hassio 'cd ~/homeassistant/wyze-snapshot && docker compose up -d --build'
 ssh hassio 'docker logs -f wyze-snapshot'        # watch the first cycle
 ssh hassio 'ls -l ~/homeassistant/config/wyze_snapshots/'
 ```
-The `.env` is only needed to enable the MQTT bridge (see `.env.example`); the
+The `.env` is only needed to enable the optional features — the MQTT bridge
+(`MQTT_PASS`) and/or the event-driven grab (`HA_TOKEN`); see `.env.example`. The
 snapshot loop itself needs no secrets.
 
 ## Manage
