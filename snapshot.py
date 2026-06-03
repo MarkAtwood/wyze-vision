@@ -53,6 +53,16 @@ CLIENT_ID = os.environ.get("CLIENT_ID", "ada06f08-87f4-4e13-b699-e82db8517ae5")
 # Persisted per-camera online history, used to date the "offline since" label.
 STATE_FILE = os.environ.get("STATE_FILE", os.path.join(OUT_DIR, ".offline_state.json"))
 
+# Optional MQTT publish of each camera's Wyze cloud connection state, consumed
+# by the device-inventory sidecar to date its Wyze tab "Last Seen" from the
+# durable cloud conn_state_ts instead of HA's restart-pinned last_updated
+# (Hassio-708). Opt-in: the publisher only activates when all of MQTT_HOST,
+# MQTT_USER and MQTT_PASS are set, so this sidecar stays secretless by default.
+MQTT_HOST = os.environ.get("MQTT_HOST", "")
+MQTT_PORT = int(os.environ.get("MQTT_PORT", "1883"))
+MQTT_USER = os.environ.get("MQTT_USER", "")
+MQTT_PASS = os.environ.get("MQTT_PASS", "")
+
 
 def log(msg):
     print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
@@ -123,10 +133,12 @@ def wyze_offline_since(cam):
 async def collect_streams():
     """Enumerate cameras into online streams and offline placeholders.
 
-    Returns (streams, offline):
+    Returns (streams, offline, conn):
       streams  = {stream_key: go2rtc_source_line} for reachable (online) cams,
       offline  = {stream_key: (nickname, since_epoch|None)} for offline cams,
-                 where since_epoch is the Wyze cloud offline-transition time.
+                 where since_epoch is the Wyze cloud offline-transition time,
+      conn     = {mac(lower,no-colon): (conn_state, conn_state_ts_ms)} for every
+                 camera that reports a conn_state, for the optional MQTT bridge.
     """
     access, refresh = load_tokens()
     auth = await WyzeAuthLib.create(token=Token(access, refresh, time.time() + 1e5))
@@ -138,7 +150,16 @@ async def collect_streams():
 
     streams = {}
     offline = {}
+    conn = {}
     for cam in cameras:
+        # Cloud connection state for the MQTT bridge (Hassio-708) -- collected
+        # for every camera regardless of whether it yields a usable stream.
+        rd = getattr(cam, "raw_dict", None) or {}
+        mac = getattr(cam, "mac", "") or ""
+        if mac and rd.get("conn_state") is not None:
+            conn[mac.lower().replace(":", "")] = (
+                int(rd["conn_state"]), rd.get("conn_state_ts")
+            )
         key = stream_key(cam.nickname)
         if not key:
             log(f"  skip camera with empty nickname (mac={getattr(cam, 'mac', '?')})")
@@ -165,7 +186,7 @@ async def collect_streams():
             log(f"  skip {key}: bad stream info ({exc})")
             continue
         log(f"  online {key}")
-    return streams, offline
+    return streams, offline, conn
 
 
 def write_yaml(streams):
@@ -202,6 +223,52 @@ class Go2rtc:
                 self.proc.kill()
                 self.proc.wait()
         self.proc = None
+
+
+class StatusPublisher:
+    """Optional retained MQTT publish of each camera's Wyze cloud conn-state.
+
+    When MQTT_HOST/USER/PASS are all set, publishes a retained
+    `wyze/<mac>/status` message ({"conn_state", "conn_state_ts"}) per camera,
+    consumed by the device-inventory sidecar to date its Wyze tab "Last Seen"
+    from the durable cloud `conn_state_ts` rather than HA's restart-pinned
+    `last_updated` (Hassio-708). Disabled (no-op) when unconfigured so this
+    sidecar stays secretless by default.
+    """
+
+    def __init__(self):
+        self.client = None
+        if not (MQTT_HOST and MQTT_USER and MQTT_PASS):
+            log("mqtt publish disabled (MQTT_HOST/USER/PASS not all set)")
+            return
+        try:
+            import paho.mqtt.client as mqtt
+        except ImportError:
+            log("mqtt publish disabled (paho-mqtt not installed)")
+            return
+        c = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="wyze-snapshot")
+        c.username_pw_set(MQTT_USER, MQTT_PASS)
+        c.reconnect_delay_set(min_delay=1, max_delay=60)
+        c.connect_async(MQTT_HOST, MQTT_PORT, keepalive=60)
+        c.loop_start()
+        self.client = c
+        log(f"mqtt publish enabled -> {MQTT_HOST}:{MQTT_PORT} as {MQTT_USER}")
+
+    def publish(self, conn):
+        """Publish retained status for each {mac: (conn_state, conn_state_ts)}."""
+        if not self.client:
+            return
+        for mac, (state, ts) in conn.items():
+            payload = json.dumps({"conn_state": state, "conn_state_ts": ts})
+            self.client.publish(f"wyze/{mac}/status", payload, qos=1, retain=True)
+        if conn:
+            log(f"  mqtt published status for {len(conn)} cams")
+
+    def stop(self):
+        if self.client:
+            self.client.loop_stop()
+            self.client.disconnect()
+            self.client = None
 
 
 def fetch_frame(key):
@@ -283,8 +350,9 @@ def render_offline(nickname, since_epoch):
     return buf.getvalue()
 
 
-def cycle(go2rtc):
-    streams, offline = asyncio.run(collect_streams())
+def cycle(go2rtc, publisher):
+    streams, offline, conn = asyncio.run(collect_streams())
+    publisher.publish(conn)
     now = int(time.time())
     state = load_state()
 
@@ -332,6 +400,7 @@ def cycle(go2rtc):
 def main():
     os.makedirs(OUT_DIR, exist_ok=True)
     go2rtc = Go2rtc()
+    publisher = StatusPublisher()
 
     stop = {"flag": False}
 
@@ -346,7 +415,7 @@ def main():
         while not stop["flag"]:
             start = time.time()
             try:
-                cycle(go2rtc)
+                cycle(go2rtc, publisher)
             except Exception as exc:
                 log(f"cycle error (continuing): {exc!r}")
             elapsed = time.time() - start
@@ -357,6 +426,7 @@ def main():
                 time.sleep(1)
     finally:
         go2rtc.stop()
+        publisher.stop()
         log("wyze-snapshot stopped")
 
 

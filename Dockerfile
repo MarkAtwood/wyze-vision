@@ -2,11 +2,12 @@
 # (KVS WebRTC capable), ffmpeg (needed for frame.jpeg H264->JPEG), and python3.
 FROM alexxit/go2rtc:latest
 
-# wyzeapy + its C-extension deps (aiodns/pycares/aiohttp/pycryptodome) and Pillow
-# (used to render the "offline since" placeholder) install from musllinux wheels
-# with no build toolchain. --break-system-packages because the base python is
-# PEP668 externally-managed; this is a single-purpose image.
-RUN pip install --no-cache-dir --break-system-packages wyzeapy requests Pillow
+# wyzeapy + its C-extension deps (aiodns/pycares/aiohttp/pycryptodome), Pillow
+# (used to render the "offline since" placeholder) and paho-mqtt (optional
+# conn-state bridge, Hassio-708) install from musllinux wheels with no build
+# toolchain. --break-system-packages because the base python is PEP668
+# externally-managed; this is a single-purpose image.
+RUN pip install --no-cache-dir --break-system-packages wyzeapy requests Pillow paho-mqtt
 
 WORKDIR /app
 COPY snapshot.py /app/snapshot.py

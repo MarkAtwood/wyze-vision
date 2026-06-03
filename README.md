@@ -44,14 +44,37 @@ per-session client id, and go2rtc passes it verbatim as the signaling
 `recipientClientId` without needing it to match the URL's `X-Amz-ClientId`
 (verified; the proof used this same value).
 
+## Wyze cloud conn-state bridge (Hassio-708, optional)
+The Wyze device list carries `conn_state` (1=online/0=offline) and `conn_state_ts`
+(epoch ms of the last connection-state change) — a **durable** last-contact time,
+unlike HA's `last_updated` which only moves on a state change and so pins offline
+cams to the last HA restart. `ha-wyzeapi` does **not** expose `conn_state_ts` as an
+HA attribute, and only this sidecar (via `wyzeapy`) has Wyze cloud access, so it
+bridges the value over MQTT to the `device-inventory-sheet` sidecar (on `dokr`),
+which uses it to date the inventory's **Wyze tab "Last Seen"**.
+
+Each cycle, when `MQTT_HOST`/`MQTT_USER`/`MQTT_PASS` are all set, it publishes a
+**retained** `wyze/<mac>/status` message (`{"conn_state","conn_state_ts"}`,
+`<mac>` lower-case no-colon) per camera. The subscriber maps online→now,
+offline→`conn_state_ts`, no-bridge→HA `last_updated`. The publisher is **opt-in**:
+with no `MQTT_PASS` it disables itself and the sidecar stays secretless.
+
+Credentials: a dedicated, publish-only broker user `wyzesnap` (password in macOS
+Keychain svc `mqtt-wyzesnap-password`, mirrored to the inventory Secrets/API Keys
+tabs). Note the `dokr` broker has no `acl_file`, so the publish-only restriction
+is by convention (separate credential), not broker-enforced.
+
 ## Deploy (hassio VM)
 ```bash
 scp -r infra/hassio/wyze-snapshot/ hassio:~/homeassistant/wyze-snapshot/
+# enable the MQTT bridge (Hassio-708): write the wyzesnap password to .env
+ssh hassio 'umask 077; printf "MQTT_PASS=%s\n" "<wyzesnap-pw>" > ~/homeassistant/wyze-snapshot/.env'
 ssh hassio 'cd ~/homeassistant/wyze-snapshot && docker compose up -d --build'
 ssh hassio 'docker logs -f wyze-snapshot'        # watch the first cycle
 ssh hassio 'ls -l ~/homeassistant/config/wyze_snapshots/'
 ```
-No `.env` is required (see `.env.example` for the optional tunables).
+The `.env` is only needed to enable the MQTT bridge (see `.env.example`); the
+snapshot loop itself needs no secrets.
 
 ## Manage
 ```bash

@@ -15,4 +15,13 @@ services:
       - REFRESH_SECONDS=600
       - OUT_DIR=/config/wyze_snapshots
       - CONFIG_ENTRIES=/config/.storage/core.config_entries
+      # Optional Wyze cloud conn-state bridge (Hassio-708). Publishes retained
+      # wyze/<mac>/status to the dokr broker for the device-inventory sidecar.
+      # Host/user are non-secret; MQTT_PASS comes from the gitignored .env. With
+      # no .env the password is empty and the publisher disables itself, so this
+      # sidecar stays secretless by default.
+      - MQTT_HOST=10.69.44.52
+      - MQTT_PORT=1883
+      - MQTT_USER=wyzesnap
+      - MQTT_PASS=${MQTT_PASS:-}
     restart: unless-stopped
