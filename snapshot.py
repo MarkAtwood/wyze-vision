@@ -77,6 +77,20 @@ EVENT_TYPE = os.environ.get("EVENT_TYPE", "wyze_camera_event")
 # Minimum seconds between event grabs for the SAME camera (debounce a motion
 # burst). The periodic cycle is unaffected.
 EVENT_MIN_INTERVAL = int(os.environ.get("EVENT_MIN_INTERVAL", "15"))
+# Resilience to a "sick" camera (Hassio-3hd): a cam whose go2rtc/KVS stream is
+# timing out must not stall the whole event pipeline. Two layers:
+#  (A) the listener hands each event to a bounded queue drained by EVENT_WORKERS
+#      tasks, so ws.recv() never blocks on one cam's grab+burst (which would drop
+#      events for healthy cams). EVENT_QUEUE_MAX caps backlog.
+#  (B) the event path uses a TIGHT frame budget (the periodic cycle can wait out a
+#      KVS cold-start, but a live event is latency-sensitive -- a dead stream
+#      should fail in seconds, not minutes), bounds its wait for the go2rtc lock,
+#      and skips cams that failed their last periodic grab (_frame_unhealthy).
+EVENT_FRAME_TIMEOUT = int(os.environ.get("EVENT_FRAME_TIMEOUT", "8"))
+EVENT_FRAME_ATTEMPTS = int(os.environ.get("EVENT_FRAME_ATTEMPTS", "1"))
+EVENT_LOCK_TIMEOUT = int(os.environ.get("EVENT_LOCK_TIMEOUT", "20"))
+EVENT_WORKERS = int(os.environ.get("EVENT_WORKERS", "3"))
+EVENT_QUEUE_MAX = int(os.environ.get("EVENT_QUEUE_MAX", "64"))
 
 # Optional event-still archive (Hassio-5sa / -bp8 / -ud0): on a matching
 # wyze_camera_event, copy the current on-disk still to a timestamped file under
@@ -258,6 +272,11 @@ _go2rtc_lock = threading.Lock()
 current_streams = set()
 # key -> monotonic time of the last successful/attempted event grab, for debounce.
 _last_grab = {}
+# Stream keys whose frame grab FAILED in the last periodic cycle (Hassio-3hd).
+# Maintained by cycle(); read by the event path to skip a known-sick cam instead
+# of discovering it the slow way (a dead KVS stream costs a full fetch budget).
+# Mutated in place (add/discard) so no global declaration is needed.
+_frame_unhealthy = set()
 # key -> monotonic time of the last Gemini analysis, for VISION_MIN_INTERVAL.
 _vision_last = {}
 # Latch: True once we've logged that the archive is disabled (sentinel marker
@@ -534,22 +553,49 @@ class StatusPublisher:
             self.client = None
 
 
-def fetch_frame(key):
-    """Pull a JPEG for one stream, retrying while go2rtc establishes KVS."""
+def fetch_frame(key, timeout=None, attempts=None):
+    """Pull a JPEG for one stream, retrying while go2rtc establishes KVS.
+
+    timeout/attempts default to the patient periodic-cycle budget (FRAME_TIMEOUT x
+    FRAME_ATTEMPTS); the event path passes the tighter EVENT_FRAME_* values so a
+    dead stream fails in seconds (Hassio-3hd).
+    """
+    timeout = FRAME_TIMEOUT if timeout is None else timeout
+    attempts = FRAME_ATTEMPTS if attempts is None else attempts
     url = f"{GO2RTC_API}/api/frame.jpeg?src={key}"
     last_err = None
-    for attempt in range(1, FRAME_ATTEMPTS + 1):
+    for attempt in range(1, attempts + 1):
         try:
-            resp = requests.get(url, timeout=FRAME_TIMEOUT)
+            resp = requests.get(url, timeout=timeout)
             if resp.status_code == 200 and resp.content[:2] == b"\xff\xd8":
                 return resp.content
             last_err = f"http={resp.status_code} len={len(resp.content)}"
         except Exception as exc:
             last_err = str(exc)
-        if attempt < FRAME_ATTEMPTS:
+        if attempt < attempts:
             time.sleep(3)
-    log(f"  frame {key} failed after {FRAME_ATTEMPTS} attempts: {last_err}")
+    log(f"  frame {key} failed after {attempts} attempts: {last_err}")
     return None
+
+
+def _fetch_frame_locked(key):
+    """Event-path frame fetch (Hassio-3hd): grab one JPEG under the go2rtc lock
+    using the TIGHT event budget, and bound the wait for the lock itself.
+
+    The periodic cycle holds _go2rtc_lock briefly around go2rtc.restart(); a sick
+    cam mid-fetch could otherwise hold it for the full fetch budget and pin the
+    event workers. acquire(timeout) bails instead of blocking indefinitely.
+    Returns the JPEG bytes or None.
+    """
+    if not _go2rtc_lock.acquire(timeout=EVENT_LOCK_TIMEOUT):
+        log(f"  frame {key} skipped: go2rtc lock busy > {EVENT_LOCK_TIMEOUT}s")
+        return None
+    try:
+        return fetch_frame(
+            key, timeout=EVENT_FRAME_TIMEOUT, attempts=EVENT_FRAME_ATTEMPTS
+        )
+    finally:
+        _go2rtc_lock.release()
 
 
 def write_frame(key, jpeg):
@@ -676,7 +722,15 @@ def cycle(go2rtc, publisher):
                 write_baseline(key, jpeg)
                 state[key] = {"last_online": now, "offline_since": None}
                 ok += 1
+                # This cam's stream is healthy this cycle -> let the event path
+                # use it again (Hassio-3hd).
+                _frame_unhealthy.discard(key)
                 log(f"  wrote {key}.jpg ({len(jpeg)} bytes)")
+            else:
+                # Frame grab failed (KVS/go2rtc trouble): mark the cam sick so the
+                # event path skips it until a later cycle recovers it, instead of
+                # spending the full fetch budget on a dead stream (Hassio-3hd).
+                _frame_unhealthy.add(key)
     else:
         log("no online cameras this cycle")
 
@@ -724,9 +778,11 @@ def event_grab(key):
     if key not in current_streams:
         log(f"event grab {key}: skipped (no live stream this cycle)")
         return
+    if key in _frame_unhealthy:
+        log(f"event grab {key}: skipped (stream unhealthy at last cycle)")
+        return
     _last_grab[key] = now
-    with _go2rtc_lock:
-        jpeg = fetch_frame(key)
+    jpeg = _fetch_frame_locked(key)
     if jpeg:
         write_frame(key, jpeg)
         log(f"event grab {key}: wrote {key}.jpg ({len(jpeg)} bytes)")
@@ -914,18 +970,25 @@ def event_burst(key):
     if key not in current_streams:
         log(f"vision burst {key}: skipped (no live stream this cycle)")
         return []
+    if key in _frame_unhealthy:
+        log(f"vision burst {key}: skipped (stream unhealthy at last cycle)")
+        return []
     frames = []
     seen = set()
     for i in range(VISION_FRAMES):
-        with _go2rtc_lock:
-            jpeg = fetch_frame(key)
-        if jpeg:
-            # Dedupe identical frames (stalled stream) by content hash so a frozen
-            # feed costs one image, not VISION_FRAMES copies of the same picture.
-            h = hash(jpeg)
-            if h not in seen:
-                seen.add(h)
-                frames.append(jpeg)
+        jpeg = _fetch_frame_locked(key)
+        if not jpeg:
+            # Tight event budget already spent on this frame -> the stream is cold.
+            # Stop the burst rather than waiting it out on a dead feed (Hassio-3hd);
+            # whatever we collected so far still gets analysed.
+            log(f"vision burst {key}: stream cold, stopping after {len(frames)} frame(s)")
+            break
+        # Dedupe identical frames (stalled stream) by content hash so a frozen
+        # feed costs one image, not VISION_FRAMES copies of the same picture.
+        h = hash(jpeg)
+        if h not in seen:
+            seen.add(h)
+            frames.append(jpeg)
         # Sleep BETWEEN frames only (not after the last) so the burst spans
         # (VISION_FRAMES-1)*interval seconds, not one interval longer.
         if i < VISION_FRAMES - 1:
@@ -1052,78 +1115,112 @@ def vision_task(publisher, key, title, data):
 async def run_event_listener(stop, publisher):
     """Subscribe to HA's `wyze_camera_event` and grab a still per event.
 
-    Mirrors wyze-event-catalog/watcher.py's websocket handshake. On each event
-    it maps device_name -> stream_key and runs the blocking event_grab on the
-    default executor so the websocket stays responsive to ping/pong and stop.
-    When configured it then archives the still (should_archive) and/or runs a
-    Gemini vision burst (should_analyze -> vision_task, publishing to MQTT via
-    `publisher`). Reconnects with exponential backoff 1->60s. Started only when
-    HA_TOKEN is set.
+    Mirrors wyze-event-catalog/watcher.py's websocket handshake. On each event it
+    maps device_name -> stream_key and ENQUEUES the work; a pool of EVENT_WORKERS
+    tasks drains the queue, each running the blocking grab/archive/vision pipeline
+    on the default executor. The recv loop itself never blocks, so a sick camera
+    can't stall the listener or drop other cams' events (Hassio-3hd). The per-event
+    pipeline: a fresh still (event_grab), then optional archive (should_archive)
+    and/or a Gemini vision burst (should_analyze -> vision_task, publishing to MQTT
+    via `publisher`). Reconnects with exponential backoff 1->60s; workers persist
+    across reconnects. Started only when HA_TOKEN is set.
     """
     import websockets
 
     loop = asyncio.get_running_loop()
-    backoff = 1
-    while not stop["flag"]:
-        try:
-            async with websockets.connect(
-                HA_URL, max_size=None, ping_interval=20
-            ) as ws:
-                msg = json.loads(await ws.recv())
-                if msg.get("type") != "auth_required":
-                    raise RuntimeError(f"unexpected first frame: {msg}")
-                await ws.send(json.dumps({"type": "auth", "access_token": HA_TOKEN}))
-                msg = json.loads(await ws.recv())
-                if msg.get("type") != "auth_ok":
-                    raise RuntimeError(f"auth failed: {msg}")
-                log("event listener: authenticated")
 
-                await ws.send(json.dumps({
-                    "id": 1, "type": "subscribe_events", "event_type": EVENT_TYPE,
-                }))
-                msg = json.loads(await ws.recv())
-                if not msg.get("success"):
-                    raise RuntimeError(f"subscribe failed: {msg}")
-                log(f"event listener: subscribed to '{EVENT_TYPE}'")
-                backoff = 1
+    # Layer A (Hassio-3hd): the recv loop must NOT block on a camera's grab+burst,
+    # or a single sick cam (KVS timing out for minutes) stalls ws.recv() and events
+    # for healthy cams that fire in that window are lost. So each event is handed to
+    # a bounded queue drained by a small worker pool; the recv loop only enqueues.
+    queue = asyncio.Queue(maxsize=EVENT_QUEUE_MAX)
 
-                while not stop["flag"]:
-                    try:
-                        raw = await asyncio.wait_for(ws.recv(), timeout=30)
-                    except asyncio.TimeoutError:
-                        continue  # stay responsive to stop["flag"]
-                    msg = json.loads(raw)
-                    if msg.get("type") != "event":
-                        continue
-                    data = msg.get("event", {}).get("data", {})
-                    key = stream_key(data.get("device_name"))
-                    if not key:
-                        continue
-                    await loop.run_in_executor(None, event_grab, key)
-                    # Event-still archive (Hassio-5sa / -bp8): if this cam + event
-                    # match ARCHIVE_RULES, snapshot the current still to the ZFS
-                    # archive. Runs after the grab so it copies the freshest file.
-                    if should_archive(key, data):
-                        await loop.run_in_executor(None, archive_event_still, key)
-                    # Gemini vision (Hassio-5sk): if this cam + event match
-                    # VISION_RULES (and a key+MQTT are configured), pull a burst,
-                    # analyse it and publish to the discovery sensor. Awaited on the
-                    # executor so analyses stay serialised + bounded; vision_task is
-                    # best-effort (its own try/except) so a failure can't drop the ws.
-                    if should_analyze(key, data):
-                        await loop.run_in_executor(
-                            None, vision_task, publisher,
-                            key, data.get("device_name"), data,
-                        )
-        except Exception as exc:
-            if stop["flag"]:
-                break
-            log(f"event listener: connection error ({exc}); retry in {backoff}s")
-            for _ in range(backoff):
+    async def handle(key, name, data):
+        """Per-event pipeline: fresh still, then optional archive + vision."""
+        await loop.run_in_executor(None, event_grab, key)
+        # Event-still archive (Hassio-5sa / -bp8): if this cam + event match
+        # ARCHIVE_RULES, snapshot the current still to the ZFS archive. Runs after
+        # the grab so it copies the freshest file.
+        if should_archive(key, data):
+            await loop.run_in_executor(None, archive_event_still, key)
+        # Gemini vision (Hassio-5sk): if this cam + event match VISION_RULES (and a
+        # key+MQTT are configured), pull a burst, analyse it and publish to the
+        # discovery sensor. vision_task is best-effort (its own try/except).
+        if should_analyze(key, data):
+            await loop.run_in_executor(
+                None, vision_task, publisher, key, name, data,
+            )
+
+    async def worker():
+        while True:
+            key, name, data = await queue.get()
+            try:
+                await handle(key, name, data)
+            except Exception as exc:
+                log(f"event worker: {key} failed ({exc!r})")
+            finally:
+                queue.task_done()
+
+    # Workers live for the whole listener lifetime (across reconnects), so an
+    # in-flight grab is never orphaned by a websocket blip.
+    workers = [asyncio.create_task(worker()) for _ in range(EVENT_WORKERS)]
+    try:
+        backoff = 1
+        while not stop["flag"]:
+            try:
+                async with websockets.connect(
+                    HA_URL, max_size=None, ping_interval=20
+                ) as ws:
+                    msg = json.loads(await ws.recv())
+                    if msg.get("type") != "auth_required":
+                        raise RuntimeError(f"unexpected first frame: {msg}")
+                    await ws.send(json.dumps({"type": "auth", "access_token": HA_TOKEN}))
+                    msg = json.loads(await ws.recv())
+                    if msg.get("type") != "auth_ok":
+                        raise RuntimeError(f"auth failed: {msg}")
+                    log("event listener: authenticated")
+
+                    await ws.send(json.dumps({
+                        "id": 1, "type": "subscribe_events", "event_type": EVENT_TYPE,
+                    }))
+                    msg = json.loads(await ws.recv())
+                    if not msg.get("success"):
+                        raise RuntimeError(f"subscribe failed: {msg}")
+                    log(f"event listener: subscribed to '{EVENT_TYPE}'")
+                    backoff = 1
+
+                    while not stop["flag"]:
+                        try:
+                            raw = await asyncio.wait_for(ws.recv(), timeout=30)
+                        except asyncio.TimeoutError:
+                            continue  # stay responsive to stop["flag"]
+                        msg = json.loads(raw)
+                        if msg.get("type") != "event":
+                            continue
+                        data = msg.get("event", {}).get("data", {})
+                        key = stream_key(data.get("device_name"))
+                        if not key:
+                            continue
+                        # Non-blocking handoff: never await the work here. If the
+                        # queue is full (workers all stuck on slow cams), drop the
+                        # event rather than block recv -- a dropped still is cheaper
+                        # than a stalled listener; the next periodic cycle recovers.
+                        try:
+                            queue.put_nowait((key, data.get("device_name"), data))
+                        except asyncio.QueueFull:
+                            log(f"event listener: queue full, dropping {key}")
+            except Exception as exc:
                 if stop["flag"]:
                     break
-                await asyncio.sleep(1)
-            backoff = min(backoff * 2, 60)
+                log(f"event listener: connection error ({exc}); retry in {backoff}s")
+                for _ in range(backoff):
+                    if stop["flag"]:
+                        break
+                    await asyncio.sleep(1)
+                backoff = min(backoff * 2, 60)
+    finally:
+        for w in workers:
+            w.cancel()
     log("event listener: stopped")
 
 

@@ -39,6 +39,19 @@ services:
       - HA_URL=ws://127.0.0.1:8123/api/websocket
       - HA_TOKEN=${HA_TOKEN:-}
       - EVENT_MIN_INTERVAL=15
+      # Sick-camera resilience (Hassio-3hd): a cam whose go2rtc/KVS stream is
+      # timing out must not stall the whole event pipeline. The listener hands
+      # each event to a bounded queue drained by EVENT_WORKERS tasks (recv never
+      # blocks; backlog capped at EVENT_QUEUE_MAX, then events are dropped). The
+      # event path uses a TIGHT frame budget (EVENT_FRAME_TIMEOUT x
+      # EVENT_FRAME_ATTEMPTS) vs the patient periodic cycle, bounds its wait for
+      # the go2rtc lock (EVENT_LOCK_TIMEOUT), and skips cams that failed their
+      # last periodic grab. Defaults are sane; tune only if needed.
+      - EVENT_WORKERS=3
+      - EVENT_QUEUE_MAX=64
+      - EVENT_FRAME_TIMEOUT=8
+      - EVENT_FRAME_ATTEMPTS=1
+      - EVENT_LOCK_TIMEOUT=20
       # Event-still archive (Hassio-5sa / -bp8 / -ud0). Reuses the HA_TOKEN
       # listener above. Active only when the sentinel ARCHIVE_MARKER file exists
       # inside /archive (created once on the ZFS: `touch

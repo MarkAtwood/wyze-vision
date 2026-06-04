@@ -76,7 +76,8 @@ cycles with the last cycle's source lines, and the cycle period (600s) is well
 under the KVS `X-Amz-Expires` (1800s), so any camera online at the last cycle
 still has a valid stream. An event grab is just one `frame.jpeg` fetch against
 the already-running go2rtc, serialised against the cycle's go2rtc restart by a
-lock and run on an executor so it never stalls the websocket.
+lock. Each event is handed to a bounded queue drained by a small worker pool, so
+the websocket read loop never blocks on a slow camera (see resilience below).
 
 Details:
 - **Opt-in / secretless default:** the listener starts only when `HA_TOKEN` is
@@ -84,6 +85,14 @@ Details:
   `event listener disabled` and behaves exactly as before (timer only).
 - **Debounce:** at most one grab per camera per `EVENT_MIN_INTERVAL` (default
   15s), so a motion burst doesn't hammer go2rtc.
+- **Sick-camera resilience (Hassio-3hd):** a camera whose go2rtc/KVS stream is
+  timing out can't stall the pipeline. Events go to a bounded queue
+  (`EVENT_QUEUE_MAX`, default 64) drained by `EVENT_WORKERS` tasks (default 3),
+  so the read loop never serialises behind one cam. The event path uses a tight
+  fetch budget (`EVENT_FRAME_TIMEOUT`=8s × `EVENT_FRAME_ATTEMPTS`=1) instead of
+  the patient periodic budget, bounds its wait for the go2rtc lock
+  (`EVENT_LOCK_TIMEOUT`=20s), and skips any camera that failed its last periodic
+  frame grab until a later cycle recovers it.
 - **State file untouched:** event grabs write **only** the JPEG, never
   `.offline_state.json` — the periodic cycle owns that bookkeeping.
 - **Limitation (v1):** a camera that was **offline** at the last periodic cycle
