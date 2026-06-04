@@ -5,7 +5,10 @@
 #
 # LAYOUT: a PANEL view (`panel: true`) whose single root card is a vertical-stack
 # of three full-width bands:
-#   1. Wyze Event Log   -- sensor.wyze_event_log rolling history (markdown).
+#   1. Event log + Vision -- a horizontal-stack: sensor.wyze_event_log rolling
+#      history (markdown) on the LEFT, latest per-cam Gemini scene read
+#      (sensor.wyze_*_vision, markdown; auto-lists every vision sensor, newest
+#      first) on the RIGHT.
 #   2. Live cameras      -- the cams that were online (grid, 3 per row).
 #   3. Offline cameras   -- the cams that were offline (grid, 3 per row); dark
 #      "offline since" placeholder rendered by the wyze-snapshot sidecar.
@@ -45,18 +48,56 @@ views:
     cards:
       - type: vertical-stack
         cards:
-          # --- Band 1: Event log ---
-          - type: markdown
-            content: "## Wyze Event Log"
-          - type: markdown
-            title: Wyze Event Log
-            content: >
-              {% set rows = state_attr('sensor.wyze_event_log', 'entries') or [] %}
-              {% set ns = namespace(lines=[]) %}
-              {% for e in rows %}
-              {% set ns.lines = ns.lines + ['**' ~ e.cam ~ '** &middot; ' ~ e.label ~ ' &middot; ' ~ relative_time(as_datetime(e.ts)) ~ ' ago'] %}
-              {% endfor %}
-              {{ ns.lines | join('\n\n') if ns.lines else '_No Wyze events recorded yet._' }}
+          # --- Band 1: Event log (left) + Vision (right), side by side ---
+          # A horizontal-stack splits the band 50/50: the rolling event log on the
+          # left, the latest per-cam Gemini vision read on the right. Each side is
+          # its own heading+content vertical-stack.
+          - type: horizontal-stack
+            cards:
+              - type: vertical-stack
+                cards:
+                  - type: markdown
+                    content: "## Wyze Event Log"
+                  - type: markdown
+                    title: Wyze Event Log
+                    content: >
+                      {% set rows = state_attr('sensor.wyze_event_log', 'entries') or [] %}
+                      {% set ns = namespace(lines=[]) %}
+                      {% for e in rows %}
+                      {% set ns.lines = ns.lines + ['**' ~ e.cam ~ '** &middot; ' ~ e.label ~ ' &middot; ' ~ relative_time(as_datetime(e.ts)) ~ ' ago'] %}
+                      {% endfor %}
+                      {{ ns.lines | join('\n\n') if ns.lines else '_No Wyze events recorded yet._' }}
+              # Latest per-cam Gemini read (sensor.wyze_<key>_vision; state = event
+              # time, description in attributes). Cams with a real change vs their
+              # cached baseline are bold; "no change" reads are muted. Auto-lists
+              # every vision sensor, newest first -- no per-cam edits needed.
+              - type: vertical-stack
+                cards:
+                  - type: markdown
+                    content: "## Wyze Vision"
+                  - type: markdown
+                    title: Wyze Vision
+                    content: >
+                      {% set ns = namespace(items=[]) %}
+                      {% for s in states.sensor %}
+                      {% if s.entity_id.startswith('sensor.wyze_') and s.entity_id.endswith('_vision') and s.state not in ['unknown', 'unavailable'] %}
+                      {% set ns.items = ns.items + [s] %}
+                      {% endif %}
+                      {% endfor %}
+                      {% set rows = ns.items | sort(attribute='state', reverse=true) %}
+                      {% set out = namespace(lines=[]) %}
+                      {% for s in rows %}
+                      {% set cam = state_attr(s.entity_id, 'camera') or s.entity_id %}
+                      {% set summary = state_attr(s.entity_id, 'summary') or state_attr(s.entity_id, 'description') or '(no description)' %}
+                      {% set changed = state_attr(s.entity_id, 'change_detected') %}
+                      {% set ago = relative_time(as_datetime(s.state)) ~ ' ago' %}
+                      {% if changed %}
+                      {% set out.lines = out.lines + ['**' ~ cam ~ '** &middot; ' ~ summary ~ ' &middot; ' ~ ago] %}
+                      {% else %}
+                      {% set out.lines = out.lines + [cam ~ ' &middot; _no change_ &middot; ' ~ ago] %}
+                      {% endif %}
+                      {% endfor %}
+                      {{ out.lines | join('\n\n') if out.lines else '_No vision reads yet._' }}
           # --- Band 2: Live cameras ---
           - type: markdown
             content: "## Live cameras"
