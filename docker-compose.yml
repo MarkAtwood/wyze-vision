@@ -1,8 +1,8 @@
 services:
-  wyze-snapshot:
+  wyze-vision:
     build: .
-    image: wyze-snapshot:local
-    container_name: wyze-snapshot
+    image: wyze-vision:local
+    container_name: wyze-vision
     # HA runs network_mode: host; go2rtc's :1984 API is reached on loopback and
     # KVS WebRTC needs unrestricted UDP for the TURN relay, so use host net too.
     network_mode: host
@@ -11,65 +11,65 @@ services:
     # /config/wyze_snapshots/.
     volumes:
       - ../config:/config
-      # Front-porch person archive (Hassio-5sa): the proxmox ZFS share
-      # tank/shared, NFS-mounted on this host at /mnt/tank-shared. Person events
-      # on the porch cam copy the current still into <key>/ subdirs here. The
-      # NFS mount must be UP before this container starts, else docker would
-      # auto-create an empty LOCAL /mnt/tank-shared/wyze and writes would miss
-      # the ZFS; fstab _netdev handles that on boot.
-      - /mnt/tank-shared/wyze:/archive
+      # Optional event-still archive: a durable share (e.g. NFS-mounted NAS)
+      # for selected camera events. Person/AI events copy the current still into
+      # <key>/ subdirs here. The mount must be UP before this container starts,
+      # else docker would auto-create an empty LOCAL /mnt/nas/wyze and writes
+      # would miss the share; an fstab _netdev entry handles that on boot. Adjust
+      # the host path to wherever your archive share is mounted.
+      - /mnt/nas/wyze:/archive
     environment:
       - REFRESH_SECONDS=600
       - OUT_DIR=/config/wyze_snapshots
       - CONFIG_ENTRIES=/config/.storage/core.config_entries
-      # Optional Wyze cloud conn-state bridge (Hassio-708). Publishes retained
-      # wyze/<mac>/status to the dokr broker for the device-inventory sidecar.
+      # Optional Wyze cloud conn-state bridge. Publishes retained
+      # wyze/<mac>/status to your MQTT broker for downstream consumers.
       # Host/user are non-secret; MQTT_PASS comes from the gitignored .env. With
       # no .env the password is empty and the publisher disables itself, so this
       # sidecar stays secretless by default.
-      - MQTT_HOST=10.69.44.52
+      - MQTT_HOST=mqtt.example.lan
       - MQTT_PORT=1883
-      - MQTT_USER=wyzesnap
+      - MQTT_USER=wyze-vision
       - MQTT_PASS=${MQTT_PASS:-}
-      # Optional event-driven fast path (Hassio-i0w): on a wyze_camera_event,
-      # grab a fresh still for that one camera immediately instead of waiting for
-      # the next periodic cycle. HA_URL is non-secret; HA_TOKEN (an HA LLAT named
-      # 'wyze-snapshot') comes from the gitignored .env. With no .env the token is
-      # empty and the listener disables itself, so this sidecar stays secretless.
+      # Optional event-driven fast path: on a wyze_camera_event, grab a fresh
+      # still for that one camera immediately instead of waiting for the next
+      # periodic cycle. HA_URL is non-secret; HA_TOKEN (a Home Assistant
+      # long-lived access token) comes from the gitignored .env. With no .env the
+      # token is empty and the listener disables itself, so this sidecar stays
+      # secretless.
       - HA_URL=ws://127.0.0.1:8123/api/websocket
       - HA_TOKEN=${HA_TOKEN:-}
       - EVENT_MIN_INTERVAL=15
-      # Sick-camera resilience (Hassio-3hd): a cam whose go2rtc/KVS stream is
-      # timing out must not stall the whole event pipeline. The listener hands
-      # each event to a bounded queue drained by EVENT_WORKERS tasks (recv never
-      # blocks; backlog capped at EVENT_QUEUE_MAX, then events are dropped). The
-      # event path uses a TIGHT frame budget (EVENT_FRAME_TIMEOUT x
-      # EVENT_FRAME_ATTEMPTS) vs the patient periodic cycle, bounds its wait for
-      # the go2rtc lock (EVENT_LOCK_TIMEOUT), and skips cams that failed their
-      # last periodic grab. Defaults are sane; tune only if needed.
+      # Sick-camera resilience: a cam whose go2rtc/KVS stream is timing out must
+      # not stall the whole event pipeline. The listener hands each event to a
+      # bounded queue drained by EVENT_WORKERS tasks (recv never blocks; backlog
+      # capped at EVENT_QUEUE_MAX, then events are dropped). The event path uses a
+      # TIGHT frame budget (EVENT_FRAME_TIMEOUT x EVENT_FRAME_ATTEMPTS) vs the
+      # patient periodic cycle, bounds its wait for the go2rtc lock
+      # (EVENT_LOCK_TIMEOUT), and skips cams that failed their last periodic grab.
+      # Defaults are sane; tune only if needed.
       - EVENT_WORKERS=3
       - EVENT_QUEUE_MAX=64
       - EVENT_FRAME_TIMEOUT=8
       - EVENT_FRAME_ATTEMPTS=1
       - EVENT_LOCK_TIMEOUT=20
-      # Wyze detection-media fast path (Hassio-zcm): the wyze_camera_event payload
-      # carries Wyze's OWN cloud-AI screenshot (event_screenshot), captured AT
-      # detection time, so it contains the subject -- unlike a live go2rtc grab taken
+      # Wyze detection-media fast path: the wyze_camera_event payload carries
+      # Wyze's OWN cloud-AI screenshot (event_screenshot), captured AT detection
+      # time, so it contains the subject -- unlike a live go2rtc grab taken
       # seconds-to-tens-of-seconds later (ha-wyzeapi polls Wyze every 30s). When on
       # and the payload has a screenshot we use THAT for the still + archive + Gemini
       # vision and skip the live grab; we fall back to the live grab/burst when it's
       # absent. The URL is self-authenticating via its signed token but Wyze's
-      # gateway only honours a recognised client User-Agent (Hassio-2ph), so we send
+      # gateway only honours a recognised client User-Agent, so we send
       # EVENT_MEDIA_UA. Set EVENT_USE_SCREENSHOT=0 to force the old live grab.
       - EVENT_USE_SCREENSHOT=1
       - EVENT_MEDIA_UA=okhttp/4.9.3
       - EVENT_MEDIA_TIMEOUT=10
-      # Event-still archive (Hassio-5sa / -bp8 / -ud0). Reuses the HA_TOKEN
-      # listener above. Active only when the sentinel ARCHIVE_MARKER file exists
-      # inside /archive (created once on the ZFS: `touch
-      # /mnt/tank/shared/wyze/.archive_root`); if the NFS mount is down docker
-      # auto-creates an empty LOCAL /archive without the marker and the archive
-      # disables, so stills never land on local disk. ARCHIVE_RULES is JSON
+      # Event-still archive. Reuses the HA_TOKEN listener above. Active only when
+      # the sentinel ARCHIVE_MARKER file exists inside /archive (created once on
+      # the share: `touch /mnt/nas/wyze/.archive_root`); if the mount is down
+      # docker auto-creates an empty LOCAL /archive without the marker and the
+      # archive disables, so stills never land on local disk. ARCHIVE_RULES is JSON
       # {stream_key: [label, ...]} (labels: person/pet/vehicle/package, or "any"
       # for every event) -- edit here to add/change archived cams or event types,
       # no code change. Per-cam subdirs are auto-created on first write.
@@ -77,17 +77,17 @@ services:
       - ARCHIVE_MARKER=.archive_root
       - 'ARCHIVE_RULES={"front_door": ["person"]}'
       - ARCHIVE_RETENTION_DAYS=100
-      # Optional Gemini vision analysis (Hassio-5sk): on a matching event, grab a
-      # short multi-frame burst from the warm go2rtc stream, send it to Gemini for
-      # a structured description (what's there + what CHANGES across the frames),
+      # Optional Gemini vision analysis: on a matching event, grab a short
+      # multi-frame burst from the warm go2rtc stream, send it to Gemini for a
+      # structured description (what's there + what CHANGES across the frames),
       # and publish the result to an MQTT-discovery HA sensor (sensor.wyze_<key>_
       # vision; state = event time, descriptive fields in attributes). Reuses the
       # MQTT_* publisher above for the sensor. Active only when GEMINI_API_KEY is
-      # set (from the gitignored .env, sourced from Keychain 'gemini-api-key') AND
-      # MQTT is configured -- secretless by default. VISION_RULES is JSON
-      # {stream_key|"*": [label|"any", ...]}; the default analyses every cam on
-      # every event. Tune the burst with VISION_FRAMES / VISION_FRAME_INTERVAL and
-      # the per-cam cost cap with VISION_MIN_INTERVAL.
+      # set (from the gitignored .env) AND MQTT is configured -- secretless by
+      # default. VISION_RULES is JSON {stream_key|"*": [label|"any", ...]}; the
+      # default analyses every cam on every event. Tune the burst with
+      # VISION_FRAMES / VISION_FRAME_INTERVAL and the per-cam cost cap with
+      # VISION_MIN_INTERVAL.
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}
       - VISION_MODEL=gemini-2.5-flash
       - 'VISION_RULES={"*": ["any"]}'
@@ -95,9 +95,9 @@ services:
       - VISION_FRAME_INTERVAL=1.5
       - VISION_MIN_INTERVAL=30
       - VISION_DISCOVERY_PREFIX=homeassistant
-      # Recurring-background suppression (Hassio-i02): cache each cam's ambient
-      # periodic still and send it to Gemini as a reference so it reports only what
-      # differs from the fixed scene (adds a change_detected flag). Set to 0 to send
-      # the raw burst with no reference.
+      # Recurring-background suppression: cache each cam's ambient periodic still
+      # and send it to Gemini as a reference so it reports only what differs from
+      # the fixed scene (adds a change_detected flag). Set to 0 to send the raw
+      # burst with no reference.
       - VISION_BASELINE=1
     restart: unless-stopped
