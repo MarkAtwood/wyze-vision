@@ -272,17 +272,36 @@ The HA-side artifacts (`cameras-dashboard.yaml`, `hide_live_wyze_cams.sh`,
 `provision_local_file_cameras.sh`) live under `deploy/` — they configure the HA
 side and are not part of the container build.
 
-**The dashboard is not auto-built.** The container only writes JPEGs; it never
-touches Home Assistant's Lovelace config. Wiring up the "Cameras" view is a manual,
-one-time HA-side step:
+The container only writes JPEGs; it never touches Home Assistant's Lovelace
+config. First create the camera entities, then build the dashboard one of two ways:
+
 - `deploy/provision_local_file_cameras.sh` creates the `local_file` camera entities
-  (`camera.wyze_<key>_snapshot`) that read those JPEGs.
-- `deploy/cameras-dashboard.yaml` is a **static, hand-edited example** dashboard —
-  copy it to `/config/dashboards/cameras.yaml` and reference it from
-  `configuration.yaml` under `lovelace: dashboards:`. The camera keys in it are
-  **placeholders** (`front_door`, `driveway`, …) you replace with your own, and the
-  Live/Offline split is the last-known state when you write the file (a live split
-  would need the `auto-entities` custom card).
+  (`camera.wyze_<key>_snapshot`) that read those JPEGs. Run it once (admin token).
+
+**Build the dashboard automatically (recommended).**
+`deploy/build_cameras_dashboard.py` discovers your real `camera.wyze_<key>_snapshot`
+tiles from HA's `/api/states`, splits them Live/Offline by each live `camera.<key>`
+state, and pushes a **storage-mode "Cameras" dashboard** into the HA sidebar over the
+WebSocket API — no `configuration.yaml` edit, no restart, no placeholder editing:
+```bash
+HA_URL=http://homeassistant.local:8123 HA_TOKEN=<admin-token> \
+  .venv/bin/python deploy/build_cameras_dashboard.py
+```
+It creates a **named** dashboard (`url_path` `wyze-cameras`, its own sidebar entry),
+so it never touches your main/overview dashboard. It is idempotent — re-run it
+whenever your cameras change and it **overwrites** that dashboard's config.
+Requires an **admin** long-lived token (creating a dashboard is admin-only) and the
+`websockets` package (`pip install websockets`, already pinned in `requirements.txt`).
+Online/offline is read from each live `camera.<key>` at push time (a cam whose live
+entity is `unavailable`/`off`/`unknown`, or absent, lands accordingly). Override the
+defaults with `DASH_URL_PATH` / `DASH_TITLE` / `DASH_ICON`.
+
+**Or hand-edit a YAML dashboard.**
+`deploy/cameras-dashboard.yaml` is a **static example** — copy it to
+`/config/dashboards/cameras.yaml` and reference it from `configuration.yaml` under
+`lovelace: dashboards:`. The camera keys in it are **placeholders** you replace with
+your own, and the Live/Offline split is frozen at the last-known state when you write
+the file.
 
 ## Development / tests
 The pure logic (stream-key/URL normalization, event-label matching, archive/vision
