@@ -52,6 +52,18 @@ services:
       - EVENT_FRAME_TIMEOUT=8
       - EVENT_FRAME_ATTEMPTS=1
       - EVENT_LOCK_TIMEOUT=20
+      # Wyze detection-media fast path (Hassio-zcm): the wyze_camera_event payload
+      # carries Wyze's OWN cloud-AI screenshot (event_screenshot), captured AT
+      # detection time, so it contains the subject -- unlike a live go2rtc grab taken
+      # seconds-to-tens-of-seconds later (ha-wyzeapi polls Wyze every 30s). When on
+      # and the payload has a screenshot we use THAT for the still + archive + Gemini
+      # vision and skip the live grab; we fall back to the live grab/burst when it's
+      # absent. The URL is self-authenticating via its signed token but Wyze's
+      # gateway only honours a recognised client User-Agent (Hassio-2ph), so we send
+      # EVENT_MEDIA_UA. Set EVENT_USE_SCREENSHOT=0 to force the old live grab.
+      - EVENT_USE_SCREENSHOT=1
+      - EVENT_MEDIA_UA=okhttp/4.9.3
+      - EVENT_MEDIA_TIMEOUT=10
       # Event-still archive (Hassio-5sa / -bp8 / -ud0). Reuses the HA_TOKEN
       # listener above. Active only when the sentinel ARCHIVE_MARKER file exists
       # inside /archive (created once on the ZFS: `touch

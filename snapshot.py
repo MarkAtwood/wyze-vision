@@ -92,6 +92,25 @@ EVENT_LOCK_TIMEOUT = int(os.environ.get("EVENT_LOCK_TIMEOUT", "20"))
 EVENT_WORKERS = int(os.environ.get("EVENT_WORKERS", "3"))
 EVENT_QUEUE_MAX = int(os.environ.get("EVENT_QUEUE_MAX", "64"))
 
+# Wyze detection-media fast path (Hassio-zcm): the wyze_camera_event payload carries
+# Wyze's OWN cloud-AI detection screenshot (event_screenshot), captured AT detection
+# time -- so it contains the subject that triggered the event, unlike a live go2rtc
+# grab taken seconds-to-tens-of-seconds later (ha-wyzeapi polls Wyze every 30s, then
+# KVS connect adds more, so the subject has usually left frame). When this is on and
+# the payload has a screenshot we use THAT as the event still (dashboard tile +
+# archive + Gemini vision) and skip the live grab; we fall back to the live go2rtc
+# grab/burst when it's absent or unfetchable. The URL is self-authenticating via its
+# signed `st` token (NO Wyze access token needed), but Wyze's gateway only honours a
+# recognised client User-Agent and returns a misleading 401 'Access token is invalid.'
+# for unknown/bot UAs (Hassio-2ph) -- so we send EVENT_MEDIA_UA. (event_video is also
+# in the payload but is typically a 404 for these cams -- no Cam Plus cloud clip --
+# so only the still is used.) Set EVENT_USE_SCREENSHOT=0 to force the old live grab.
+EVENT_USE_SCREENSHOT = os.environ.get("EVENT_USE_SCREENSHOT", "1") not in (
+    "0", "false", "no", ""
+)
+EVENT_MEDIA_UA = os.environ.get("EVENT_MEDIA_UA", "okhttp/4.9.3")
+EVENT_MEDIA_TIMEOUT = int(os.environ.get("EVENT_MEDIA_TIMEOUT", "10"))
+
 # Optional event-still archive (Hassio-5sa / -bp8 / -ud0): on a matching
 # wyze_camera_event, copy the current on-disk still to a timestamped file under
 # ARCHIVE_DIR/<key>/, pruned to ARCHIVE_RETENTION_DAYS. Which cameras + event
@@ -234,14 +253,14 @@ VISION_SCHEMA = {
 # No-reference prompt (VISION_BASELINE off, or no baseline cached yet): describe the
 # burst on its own. change_detected is always true here (no baseline to compare to).
 VISION_PROMPT = (
-    "These images are a time-ordered burst of frames from a single home security "
-    "camera named '{title}', captured ~{interval}s apart during a motion event"
-    "{label_hint}. Treat them as one short sequence, not separate scenes. Report: "
+    "These image(s) are from a single home security camera named '{title}', captured "
+    "during a motion event{label_hint}.{box_hint} If there are several, treat them as "
+    "one time-ordered burst ~{interval}s apart, not separate scenes. Report: "
     "change_detected (always true here, there is no reference); a one-line summary; "
-    "a fuller description of the scene; what CHANGES across the frames (who/what "
-    "moves, in which direction, what they are doing); counts and presence of people, "
-    "packages, vehicles and pets; and anything notable or concerning. If nothing of "
-    "interest is present, say so plainly."
+    "a fuller description of the scene; what is happening (and, across the frames if "
+    "there are several, who/what moves, in which direction, what they are doing); "
+    "counts and presence of people, packages, vehicles and pets; and anything notable "
+    "or concerning. If nothing of interest is present, say so plainly."
 )
 
 # Reference-frame prompt (VISION_BASELINE on, baseline available): the recurring
@@ -250,16 +269,17 @@ VISION_PROMPT = (
 VISION_PROMPT_BASELINE = (
     "You are analyzing a home security camera named '{title}'. The FIRST image is "
     "this camera's normal, EMPTY background with no event happening. The remaining "
-    "images are a time-ordered burst captured ~{interval}s apart during a motion "
-    "event{label_hint}. IGNORE everything that also appears in the background image: "
-    "the building, fixed furniture, parked vehicles, plants, signage, and any "
-    "lighting or day/night IR differences. Describe ONLY what is NEW, moving, or "
-    "changed relative to the background -- who or what entered, where it moved across "
-    "the burst, and what it is doing. Counts and *_present flags must cover only "
-    "things that are NOT part of the background. If the burst is essentially "
-    "identical to the background, set change_detected false, summary to 'no change', "
-    "and every *_present flag false. Otherwise set change_detected true. Note "
-    "anything concerning."
+    "image(s) were captured during a motion event{label_hint}; if there are several "
+    "they are a time-ordered burst ~{interval}s apart.{box_hint} IGNORE everything that also "
+    "appears in the background image: the building, fixed furniture, parked vehicles, "
+    "plants, signage, and any lighting or day/night IR differences. Describe ONLY "
+    "what is NEW, moving, or changed relative to the background -- who or what "
+    "entered, where it is (and how it moves across the frames if there are several), "
+    "and what it is doing. Counts and *_present flags must cover only things that are "
+    "NOT part of the background. If the event image(s) are essentially identical to "
+    "the background, set change_detected false, summary to 'no change', and every "
+    "*_present flag false. Otherwise set change_detected true. Note anything "
+    "concerning."
 )
 
 # --- shared state between the periodic cycle and the event listener ----------
@@ -759,6 +779,58 @@ def cycle(go2rtc, publisher):
     )
 
 
+def fetch_event_screenshot(data):
+    """Fetch Wyze's own detection screenshot from a wyze_camera_event payload.
+
+    Returns the JPEG bytes, or None if the payload has no screenshot URL or the
+    fetch fails. The URL (host prod-sight-safe-auth.wyze.com) is self-authenticating
+    via its signed `st` query token -- NO Wyze access token is sent. Wyze's gateway
+    runs a User-Agent allowlist and answers a misleading 401 'Access token is
+    invalid.' for unknown/bot UAs, so we send EVENT_MEDIA_UA (a recognised client
+    UA). We send NO Authorization header (the Azure-blob backend 400s on one). See
+    Hassio-2ph for the reverse-engineering of this auth path.
+    """
+    url = (data or {}).get("event_screenshot")
+    if not url:
+        return None
+    try:
+        r = requests.get(
+            url,
+            headers={"User-Agent": EVENT_MEDIA_UA},
+            timeout=EVENT_MEDIA_TIMEOUT,
+        )
+    except Exception as exc:
+        log(f"event screenshot fetch failed: {exc!r}")
+        return None
+    if r.status_code != 200:
+        log(f"event screenshot fetch: HTTP {r.status_code}")
+        return None
+    jpeg = r.content
+    if not jpeg or jpeg[:2] != b"\xff\xd8":
+        log(f"event screenshot fetch: not a JPEG ({len(jpeg)} bytes)")
+        return None
+    return jpeg
+
+
+def use_event_screenshot(key, jpeg):
+    """Publish Wyze's detection screenshot as the event still for `key`.
+
+    Runs on the event listener's executor thread. Writes ONLY the JPEG (same as
+    event_grab) and shares its EVENT_MIN_INTERVAL debounce + _last_grab clock, so a
+    screenshot and a live grab never double-write within the window. Does NOT touch
+    go2rtc and does NOT write a baseline (the baseline is the recurring EMPTY scene,
+    captured by the periodic cycle -- an event screenshot is the opposite of that).
+    """
+    now = time.monotonic()
+    last = _last_grab.get(key, 0)
+    if now - last < EVENT_MIN_INTERVAL:
+        log(f"event screenshot {key}: debounced ({now - last:.0f}s < {EVENT_MIN_INTERVAL}s)")
+        return
+    _last_grab[key] = now
+    write_frame(key, jpeg)
+    log(f"event screenshot {key}: wrote {key}.jpg ({len(jpeg)} bytes)")
+
+
 def event_grab(key):
     """Grab a single fresh frame for `key` in response to a camera event.
 
@@ -1006,7 +1078,7 @@ def _image_part(jpeg):
     }
 
 
-def analyze_with_gemini(frames, title, labels, baseline=None):
+def analyze_with_gemini(frames, title, labels, baseline=None, boxed=False):
     """Send a burst of JPEGs to Gemini and return the parsed structured result.
 
     Builds a single multimodal request. When `baseline` (a reference JPEG of the
@@ -1025,11 +1097,23 @@ def analyze_with_gemini(frames, title, labels, baseline=None):
     # has a steer ("the camera's AI flagged: person, package") without us asserting
     # they're correct -- it still reports what it actually sees.
     label_hint = f" (the camera's AI flagged: {', '.join(sorted(labels))})" if labels else ""
+    # box_hint (Hassio-zcm): Wyze's event_screenshot has a GREEN bounding box drawn
+    # over the region its detector flagged as moving. Point the model at it so it
+    # focuses on the actual trigger, but tell it the box is a software overlay (not a
+    # real object) so it isn't described as part of the scene. Live go2rtc fallback
+    # frames have no box, so this is empty for them (boxed=False).
+    box_hint = (
+        " Wyze has drawn a GREEN BOUNDING BOX on the image around the region its "
+        "motion detector flagged -- look there first to find what triggered the "
+        "event. The box is a software overlay, not a real object: do not describe "
+        "the box itself."
+    ) if boxed else ""
     template = VISION_PROMPT_BASELINE if baseline else VISION_PROMPT
     prompt = template.format(
         title=title or "camera",
         interval=VISION_FRAME_INTERVAL,
         label_hint=label_hint,
+        box_hint=box_hint,
     )
     parts = [{"text": prompt}]
     if baseline:
@@ -1071,14 +1155,18 @@ def analyze_with_gemini(frames, title, labels, baseline=None):
         return None
 
 
-def vision_task(publisher, key, title, data):
+def vision_task(publisher, key, title, data, shot=None):
     """Burst -> Gemini -> MQTT for one event. Best-effort, runs on the executor.
 
     Steps (any failure logs and returns -- never kills the listener):
       1. require the MQTT publisher (the sensor rides the same broker);
       2. debounce -- skip if we analysed this key < VISION_MIN_INTERVAL ago;
-      3. pull a burst, send it to Gemini, publish the structured result to the
+      3. get frames, send them to Gemini, publish the structured result to the
          per-cam discovery sensor.
+    When `shot` is given (Wyze's own detection screenshot, Hassio-zcm) it is used as
+    the single vision frame -- it was captured AT detection time so it actually
+    contains the subject, unlike a live burst grabbed seconds-to-tens-of-seconds
+    later. Otherwise we fall back to a live go2rtc burst (event_burst).
     """
     # The result lands on an MQTT-discovery sensor, so without the publisher there's
     # nowhere to put it -- skip rather than pay Gemini for an unpublishable answer.
@@ -1091,7 +1179,7 @@ def vision_task(publisher, key, title, data):
             log(f"vision {key}: debounced ({now - last:.0f}s < {VISION_MIN_INTERVAL}s)")
             return
         _vision_last[key] = now
-        frames = event_burst(key)
+        frames = [shot] if shot is not None else event_burst(key)
         if not frames:
             log(f"vision {key}: no frames")
             return
@@ -1099,7 +1187,11 @@ def vision_task(publisher, key, title, data):
         # model reports only what differs. None until the first periodic cycle has
         # cached one for this cam -> falls back to describing the raw burst.
         baseline = load_baseline(key)
-        result = analyze_with_gemini(frames, title, event_labels(data), baseline)
+        # boxed: only the Wyze event_screenshot (shot) carries the green detection
+        # box; the live event_burst fallback does not.
+        result = analyze_with_gemini(
+            frames, title, event_labels(data), baseline, boxed=shot is not None
+        )
         if result is None:
             log(f"vision {key}: no result")
             return
@@ -1120,10 +1212,11 @@ async def run_event_listener(stop, publisher):
     tasks drains the queue, each running the blocking grab/archive/vision pipeline
     on the default executor. The recv loop itself never blocks, so a sick camera
     can't stall the listener or drop other cams' events (Hassio-3hd). The per-event
-    pipeline: a fresh still (event_grab), then optional archive (should_archive)
-    and/or a Gemini vision burst (should_analyze -> vision_task, publishing to MQTT
-    via `publisher`). Reconnects with exponential backoff 1->60s; workers persist
-    across reconnects. Started only when HA_TOKEN is set.
+    pipeline: a detection still -- Wyze's own event_screenshot when present
+    (Hassio-zcm), else a live grab (event_grab) -- then optional archive
+    (should_archive) and/or a Gemini vision read (should_analyze -> vision_task,
+    publishing to MQTT via `publisher`). Reconnects with exponential backoff 1->60s;
+    workers persist across reconnects. Started only when HA_TOKEN is set.
     """
     import websockets
 
@@ -1136,19 +1229,32 @@ async def run_event_listener(stop, publisher):
     queue = asyncio.Queue(maxsize=EVENT_QUEUE_MAX)
 
     async def handle(key, name, data):
-        """Per-event pipeline: fresh still, then optional archive + vision."""
-        await loop.run_in_executor(None, event_grab, key)
+        """Per-event pipeline: detection still, then optional archive + vision.
+
+        Hassio-zcm: prefer Wyze's OWN event_screenshot (captured at detection time,
+        so it contains the subject) as the still and the single vision frame; fall
+        back to a live go2rtc grab/burst only when the screenshot is absent. The
+        screenshot is fetched ONCE here and reused for the still + the vision read.
+        """
+        shot = None
+        if EVENT_USE_SCREENSHOT:
+            shot = await loop.run_in_executor(None, fetch_event_screenshot, data)
+        if shot is not None:
+            await loop.run_in_executor(None, use_event_screenshot, key, shot)
+        else:
+            await loop.run_in_executor(None, event_grab, key)
         # Event-still archive (Hassio-5sa / -bp8): if this cam + event match
         # ARCHIVE_RULES, snapshot the current still to the ZFS archive. Runs after
-        # the grab so it copies the freshest file.
+        # the still is written so it copies the freshest file (screenshot or grab).
         if should_archive(key, data):
             await loop.run_in_executor(None, archive_event_still, key)
         # Gemini vision (Hassio-5sk): if this cam + event match VISION_RULES (and a
-        # key+MQTT are configured), pull a burst, analyse it and publish to the
-        # discovery sensor. vision_task is best-effort (its own try/except).
+        # key+MQTT are configured), analyse the detection still (or a live burst when
+        # there was none) and publish to the discovery sensor. vision_task is
+        # best-effort (its own try/except).
         if should_analyze(key, data):
             await loop.run_in_executor(
-                None, vision_task, publisher, key, name, data,
+                None, vision_task, publisher, key, name, data, shot,
             )
 
     async def worker():

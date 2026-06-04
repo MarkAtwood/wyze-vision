@@ -99,6 +99,39 @@ Details:
   has no go2rtc stream, so its event is skipped (logged) and picked up by the
   next cycle.
 
+## Detection-screenshot fast path (Hassio-zcm)
+A live go2rtc grab is always **late**: `ha-wyzeapi` polls the Wyze cloud event
+list every ~30s, so `wyze_camera_event` can fire long after the real detection,
+and the KVS connect adds more. By the time we grab a "fresh" frame the subject has
+usually left. But the event payload **already carries Wyze's own cloud-AI
+screenshot** (`event_screenshot`), captured **at detection time** — it actually
+contains the subject.
+
+When `EVENT_USE_SCREENSHOT=1` (default) and the payload has a screenshot, the
+sidecar fetches it once and uses it as the still for the **tile, the ZFS archive,
+and the Gemini vision read** (a single 640×360 detection frame plus the existing
+empty-scene baseline), skipping the live grab entirely. When the screenshot is
+absent or unfetchable it falls back to the live `event_grab` / vision burst, so
+behaviour degrades gracefully. Set `EVENT_USE_SCREENSHOT=0` to force the old live
+grab.
+
+- **Auth (Hassio-2ph):** the `event_screenshot` URL
+  (`prod-sight-safe-auth.wyze.com`) is **self-authenticating** via its signed `st`
+  query token — **no** Wyze access token is sent. Wyze's gateway runs a
+  User-Agent allowlist and returns a misleading `401 "Access token is invalid."`
+  for unknown/bot UAs, so the fetch sends `EVENT_MEDIA_UA` (default `okhttp/4.9.3`,
+  the Wyze Android app UA). **No `Authorization` header** is sent (the Azure-blob
+  backend `400`s on one). `EVENT_MEDIA_TIMEOUT` (default 10s) bounds the fetch.
+- **Debounce shared:** uses the same `EVENT_MIN_INTERVAL` clock as `event_grab`,
+  so a screenshot and a live grab never double-write a tile within the window.
+- **`event_video`:** also present in the payload but typically `404` for these
+  cams (no Cam Plus cloud clip), so only the still is used.
+- **Green detection box:** Wyze draws a green bounding box on `event_screenshot`
+  around the region it flagged as moving. When the vision frame is a screenshot the
+  Gemini prompt is told about the box so it focuses on the trigger — while being
+  told the box is a software overlay, not a real object (so it isn't described as
+  part of the scene). Live-fallback frames have no box, so the hint is omitted.
+
 ## Event-still archive (Hassio-5sa / -bp8 / -ud0, optional)
 The event listener also archives a **history of selected camera events** to durable
 ZFS storage. When a `wyze_camera_event` arrives, the sidecar consults `ARCHIVE_RULES`
