@@ -52,4 +52,27 @@ services:
       - ARCHIVE_MARKER=.archive_root
       - 'ARCHIVE_RULES={"front_door": ["person"]}'
       - ARCHIVE_RETENTION_DAYS=100
+      # Optional Gemini vision analysis (Hassio-5sk): on a matching event, grab a
+      # short multi-frame burst from the warm go2rtc stream, send it to Gemini for
+      # a structured description (what's there + what CHANGES across the frames),
+      # and publish the result to an MQTT-discovery HA sensor (sensor.wyze_<key>_
+      # vision; state = event time, descriptive fields in attributes). Reuses the
+      # MQTT_* publisher above for the sensor. Active only when GEMINI_API_KEY is
+      # set (from the gitignored .env, sourced from Keychain 'gemini-api-key') AND
+      # MQTT is configured -- secretless by default. VISION_RULES is JSON
+      # {stream_key|"*": [label|"any", ...]}; the default analyses every cam on
+      # every event. Tune the burst with VISION_FRAMES / VISION_FRAME_INTERVAL and
+      # the per-cam cost cap with VISION_MIN_INTERVAL.
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - VISION_MODEL=gemini-2.5-flash
+      - 'VISION_RULES={"*": ["any"]}'
+      - VISION_FRAMES=4
+      - VISION_FRAME_INTERVAL=1.5
+      - VISION_MIN_INTERVAL=30
+      - VISION_DISCOVERY_PREFIX=homeassistant
+      # Recurring-background suppression (Hassio-i02): cache each cam's ambient
+      # periodic still and send it to Gemini as a reference so it reports only what
+      # differs from the fixed scene (adds a change_detected flag). Set to 0 to send
+      # the raw burst with no reference.
+      - VISION_BASELINE=1
     restart: unless-stopped

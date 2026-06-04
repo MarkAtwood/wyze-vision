@@ -18,6 +18,7 @@ aborting the cycle. Fresh KVS creds are minted every cycle, so the loop period
 MUST stay under the KVS X-Amz-Expires=1800s window.
 """
 import asyncio
+import base64
 import io
 import json
 import os
@@ -131,6 +132,122 @@ def _load_archive_rules():
 
 ARCHIVE_RULES = _load_archive_rules()
 
+# Optional Gemini vision analysis (Hassio-5sk): on a matching wyze_camera_event,
+# grab a short multi-frame burst from the (already warm) go2rtc stream, send it to
+# Gemini for a structured description, and publish the result to an MQTT-discovery
+# HA sensor (sensor.wyze_<key>_vision). Opt-in: active only when GEMINI_API_KEY is
+# set AND the MQTT publisher is configured (the sensor rides the same dokr broker
+# HA already consumes), so the sidecar stays secretless by default.
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+VISION_MODEL = os.environ.get("VISION_MODEL", "gemini-2.5-flash")
+# Gemini generateContent base. The API key rides in the query string, so the full
+# request URL must NEVER be logged (analyze_with_gemini logs status + message only).
+GEMINI_ENDPOINT = os.environ.get(
+    "GEMINI_ENDPOINT", "https://generativelanguage.googleapis.com/v1beta/models"
+)
+GEMINI_TIMEOUT = int(os.environ.get("GEMINI_TIMEOUT", "30"))
+# Burst geometry: VISION_FRAMES frames spaced VISION_FRAME_INTERVAL seconds apart,
+# pulled from the live stream so the model sees motion ACROSS the burst (the whole
+# point -- a single still often misses the moving subject). 4 x 1.5s ~= 4.5s span.
+VISION_FRAMES = int(os.environ.get("VISION_FRAMES", "4"))
+VISION_FRAME_INTERVAL = float(os.environ.get("VISION_FRAME_INTERVAL", "1.5"))
+# Per-camera debounce: minimum seconds between Gemini analyses for the SAME cam, so
+# a motion burst (many events in seconds) costs one analysis, not dozens.
+VISION_MIN_INTERVAL = int(os.environ.get("VISION_MIN_INTERVAL", "30"))
+# MQTT discovery prefix HA listens on (default 'homeassistant'); the per-cam sensor
+# config is published retained under <prefix>/sensor/wyze_vision_<key>/config.
+VISION_DISCOVERY_PREFIX = os.environ.get("VISION_DISCOVERY_PREFIX", "homeassistant")
+# Recurring-background suppression (Hassio-i02): when on, the periodic cycle caches
+# each online camera's ambient (timer-driven, usually-empty) still under BASELINE_DIR
+# and the vision burst sends that as a labeled REFERENCE frame, so Gemini reports
+# only what differs from the recurring background instead of re-describing the fixed
+# scene every event. Self-maintaining (refreshed every cycle, so it tracks lighting/
+# season). Default on; set VISION_BASELINE=0 to send the raw burst with no reference.
+VISION_BASELINE = os.environ.get("VISION_BASELINE", "1") not in ("0", "false", "no", "")
+BASELINE_DIR = os.environ.get("BASELINE_DIR", os.path.join(OUT_DIR, "baselines"))
+
+
+def _load_vision_rules():
+    """Parse VISION_RULES JSON {stream_key: [label, ...]} (same shape as
+    ARCHIVE_RULES). A top-level '*' key matches ANY camera; a rule list of ['any']
+    (or '*') matches any event for that cam. Default analyses every camera on every
+    event ({"*": ["any"]}). Bad/missing JSON disables vision (empty dict) rather
+    than crashing the sidecar at import.
+    """
+    raw = os.environ.get("VISION_RULES", '{"*": ["any"]}')
+    try:
+        parsed = json.loads(raw)
+        return {
+            key: [str(lbl).lower() for lbl in (labels or [])]
+            for key, labels in parsed.items()
+        }
+    except (ValueError, AttributeError) as exc:
+        print(f"[vision] bad VISION_RULES ({exc!r}); vision disabled", flush=True)
+        return {}
+
+
+VISION_RULES = _load_vision_rules()
+
+# JSON object Gemini must fill (structured output via responseSchema). Keeps the
+# sensor attributes stable + machine-usable: `summary` is short (sensor-friendly),
+# `motion` is the cross-frame narrative (what CHANGED between the burst frames), and
+# the *_present booleans drive automations. `notable` is optional (not required).
+VISION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "change_detected": {"type": "boolean"},
+        "summary": {"type": "string"},
+        "description": {"type": "string"},
+        "motion": {"type": "string"},
+        "people": {"type": "integer"},
+        "person_present": {"type": "boolean"},
+        "package_present": {"type": "boolean"},
+        "vehicle_present": {"type": "boolean"},
+        "pet_present": {"type": "boolean"},
+        "notable": {"type": "string"},
+    },
+    "required": [
+        "change_detected", "summary", "description", "motion", "people",
+        "person_present", "package_present", "vehicle_present", "pet_present",
+    ],
+    "propertyOrdering": [
+        "change_detected", "summary", "description", "motion", "people",
+        "person_present", "package_present", "vehicle_present", "pet_present",
+        "notable",
+    ],
+}
+
+# No-reference prompt (VISION_BASELINE off, or no baseline cached yet): describe the
+# burst on its own. change_detected is always true here (no baseline to compare to).
+VISION_PROMPT = (
+    "These images are a time-ordered burst of frames from a single home security "
+    "camera named '{title}', captured ~{interval}s apart during a motion event"
+    "{label_hint}. Treat them as one short sequence, not separate scenes. Report: "
+    "change_detected (always true here, there is no reference); a one-line summary; "
+    "a fuller description of the scene; what CHANGES across the frames (who/what "
+    "moves, in which direction, what they are doing); counts and presence of people, "
+    "packages, vehicles and pets; and anything notable or concerning. If nothing of "
+    "interest is present, say so plainly."
+)
+
+# Reference-frame prompt (VISION_BASELINE on, baseline available): the recurring
+# background is sent as image 1; the model reports only what DIFFERS from it. This
+# is the answer to 'just tell us what it sees beyond the recurring background'.
+VISION_PROMPT_BASELINE = (
+    "You are analyzing a home security camera named '{title}'. The FIRST image is "
+    "this camera's normal, EMPTY background with no event happening. The remaining "
+    "images are a time-ordered burst captured ~{interval}s apart during a motion "
+    "event{label_hint}. IGNORE everything that also appears in the background image: "
+    "the building, fixed furniture, parked vehicles, plants, signage, and any "
+    "lighting or day/night IR differences. Describe ONLY what is NEW, moving, or "
+    "changed relative to the background -- who or what entered, where it moved across "
+    "the burst, and what it is doing. Counts and *_present flags must cover only "
+    "things that are NOT part of the background. If the burst is essentially "
+    "identical to the background, set change_detected false, summary to 'no change', "
+    "and every *_present flag false. Otherwise set change_detected true. Note "
+    "anything concerning."
+)
+
 # --- shared state between the periodic cycle and the event listener ----------
 # Serialises go2rtc.restart() (in cycle()) against an event_grab()'s fetch_frame
 # so an on-event grab never races a config swap / process restart.
@@ -141,6 +258,8 @@ _go2rtc_lock = threading.Lock()
 current_streams = set()
 # key -> monotonic time of the last successful/attempted event grab, for debounce.
 _last_grab = {}
+# key -> monotonic time of the last Gemini analysis, for VISION_MIN_INTERVAL.
+_vision_last = {}
 # Latch: True once we've logged that the archive is disabled (sentinel marker
 # missing), so an event storm doesn't repeat the line every event. Reset to False
 # by archive_event_still() the moment the marker reappears, so a later outage logs
@@ -322,6 +441,10 @@ class StatusPublisher:
 
     def __init__(self):
         self.client = None
+        # Stream keys whose Gemini-vision discovery config we've already published
+        # this run, so we announce each sensor to HA exactly once (lazy, on first
+        # result) instead of every event.
+        self._vision_announced = set()
         if not (MQTT_HOST and MQTT_USER and MQTT_PASS):
             log("mqtt publish disabled (MQTT_HOST/USER/PASS not all set)")
             return
@@ -347,6 +470,62 @@ class StatusPublisher:
             self.client.publish(f"wyze/{mac}/status", payload, qos=1, retain=True)
         if conn:
             log(f"  mqtt published status for {len(conn)} cams")
+
+    def announce_vision(self, key, title):
+        """Publish (once per run) the MQTT-discovery config for a cam's vision sensor.
+
+        HA auto-creates sensor.wyze_<key>_vision from this retained message. The
+        sensor's state is the event timestamp (device_class timestamp); the
+        descriptive Gemini fields live in its json_attributes. Idempotent: skipped
+        if already announced this run.
+        """
+        if not self.client or key in self._vision_announced:
+            return
+        object_id = f"wyze_{key}_vision"
+        disco_topic = f"{VISION_DISCOVERY_PREFIX}/sensor/wyze_vision_{key}/config"
+        config = {
+            "name": f"{title or key} Vision",
+            "unique_id": object_id,
+            "object_id": object_id,
+            "state_topic": f"wyze/vision/{key}/state",
+            "json_attributes_topic": f"wyze/vision/{key}/attributes",
+            "device_class": "timestamp",
+            "icon": "mdi:eye-check",
+            # Group all vision sensors under one HA device alongside nothing else;
+            # keeps the entities tidy without colliding with the conn-state topics.
+            "device": {
+                "identifiers": ["wyze_vision"],
+                "name": "Wyze Vision",
+                "manufacturer": "wyze-snapshot",
+            },
+        }
+        self.client.publish(disco_topic, json.dumps(config), qos=1, retain=True)
+        self._vision_announced.add(key)
+        log(f"  vision: announced sensor {object_id} to HA discovery")
+
+    def publish_vision(self, key, title, result, frame_count):
+        """Publish a Gemini vision result to the cam's discovery sensor.
+
+        State = ISO8601 'now' (the event time); attributes = the full structured
+        result plus meta (model, frame count). Both retained so HA shows the last
+        result across restarts. Announces the discovery config first (lazy).
+        """
+        if not self.client:
+            return
+        self.announce_vision(key, title)
+        now_iso = datetime.now(timezone.utc).isoformat()
+        attributes = dict(result)
+        attributes.update({
+            "camera": title or key,
+            "model": VISION_MODEL,
+            "frames": frame_count,
+            "analyzed_at": now_iso,
+        })
+        self.client.publish(f"wyze/vision/{key}/state", now_iso, qos=1, retain=True)
+        self.client.publish(
+            f"wyze/vision/{key}/attributes", json.dumps(attributes),
+            qos=1, retain=True,
+        )
 
     def stop(self):
         if self.client:
@@ -380,6 +559,42 @@ def write_frame(key, jpeg):
     with open(tmp, "wb") as f:
         f.write(jpeg)
     os.replace(tmp, dst)
+
+
+def write_baseline(key, jpeg):
+    """Cache a camera's ambient frame as its vision background reference.
+
+    Written by the periodic cycle (timer-driven, so usually the empty scene), NOT
+    by event_grab -- so it stays a clean baseline even as the live <key>.jpg is
+    overwritten on each event. Atomic, and best-effort: a failure just means this
+    cycle keeps the prior baseline. No-op when VISION_BASELINE is off.
+    """
+    if not VISION_BASELINE:
+        return
+    dst = os.path.join(BASELINE_DIR, f"{key}.jpg")
+    tmp = f"{dst}.tmp"
+    try:
+        with open(tmp, "wb") as f:
+            f.write(jpeg)
+        os.replace(tmp, dst)
+    except Exception as exc:
+        log(f"  baseline {key} write failed: {exc!r}")
+
+
+def load_baseline(key):
+    """Return the cached background-reference JPEG for `key`, or None.
+
+    None when baselines are off, the cam has no cached ambient frame yet (e.g. it
+    just came online), or the read fails -- callers then analyse with no reference.
+    """
+    if not VISION_BASELINE:
+        return None
+    path = os.path.join(BASELINE_DIR, f"{key}.jpg")
+    try:
+        with open(path, "rb") as f:
+            return f.read()
+    except (FileNotFoundError, OSError):
+        return None
 
 
 def load_state():
@@ -455,6 +670,10 @@ def cycle(go2rtc, publisher):
             jpeg = fetch_frame(key)
             if jpeg:
                 write_frame(key, jpeg)
+                # Refresh this cam's vision background reference (Hassio-i02). The
+                # periodic still is timer-driven (no event), so it's our cleanest
+                # ambient frame; updating every cycle tracks lighting/season.
+                write_baseline(key, jpeg)
                 state[key] = {"last_online": now, "offline_since": None}
                 ok += 1
                 log(f"  wrote {key}.jpg ({len(jpeg)} bytes)")
@@ -561,6 +780,29 @@ def should_archive(key, data):
     return bool(event_labels(data) & set(wanted))
 
 
+def should_analyze(key, data):
+    """True if `key` should be sent to Gemini for this event.
+
+    Gated on GEMINI_API_KEY being set, then matched against VISION_RULES (same
+    shape as ARCHIVE_RULES) with an extra '*' wildcard KEY that matches ANY camera
+    (the default {"*": ["any"]} analyses every cam on every event). A rule list of
+    ['any'] (or '*') matches any event for that cam; otherwise the event must carry
+    one of the configured labels.
+    """
+    if not GEMINI_API_KEY:
+        return False
+    # Per-cam rule first, then the '*' wildcard cam as a fallback. `wanted is None`
+    # (cam absent AND no wildcard) -> not configured -> skip.
+    wanted = VISION_RULES.get(key)
+    if wanted is None:
+        wanted = VISION_RULES.get("*")
+    if not wanted:
+        return False
+    if "any" in wanted or "*" in wanted:
+        return True
+    return bool(event_labels(data) & set(wanted))
+
+
 def prune_archive(dstdir):
     """Remove archived *.jpg older than ARCHIVE_RETENTION_DAYS by mtime.
 
@@ -658,13 +900,165 @@ def archive_event_still(key):
     prune_archive(dstdir)
 
 
-async def run_event_listener(stop):
+def event_burst(key):
+    """Pull a short multi-frame burst for `key` from the warm go2rtc stream.
+
+    Runs on the listener's executor thread (blocking). Grabs up to VISION_FRAMES
+    frames VISION_FRAME_INTERVAL seconds apart so Gemini sees motion ACROSS the
+    burst (a single still often misses the moving subject). Each fetch is taken
+    under _go2rtc_lock (serialised against go2rtc.restart()), the same guard
+    event_grab uses. Byte-identical consecutive frames are dropped (a stalled
+    stream returns the same JPEG) so we don't pay to send duplicates. Returns a
+    list of JPEG byte strings (possibly empty if the cam went offline).
+    """
+    if key not in current_streams:
+        log(f"vision burst {key}: skipped (no live stream this cycle)")
+        return []
+    frames = []
+    seen = set()
+    for i in range(VISION_FRAMES):
+        with _go2rtc_lock:
+            jpeg = fetch_frame(key)
+        if jpeg:
+            # Dedupe identical frames (stalled stream) by content hash so a frozen
+            # feed costs one image, not VISION_FRAMES copies of the same picture.
+            h = hash(jpeg)
+            if h not in seen:
+                seen.add(h)
+                frames.append(jpeg)
+        # Sleep BETWEEN frames only (not after the last) so the burst spans
+        # (VISION_FRAMES-1)*interval seconds, not one interval longer.
+        if i < VISION_FRAMES - 1:
+            time.sleep(VISION_FRAME_INTERVAL)
+    return frames
+
+
+def _image_part(jpeg):
+    """Wrap a JPEG byte string as a Gemini inline_data image part."""
+    return {
+        "inline_data": {
+            "mime_type": "image/jpeg",
+            "data": base64.b64encode(jpeg).decode("ascii"),
+        }
+    }
+
+
+def analyze_with_gemini(frames, title, labels, baseline=None):
+    """Send a burst of JPEGs to Gemini and return the parsed structured result.
+
+    Builds a single multimodal request. When `baseline` (a reference JPEG of the
+    empty scene) is supplied, it is sent FIRST -- labeled as the background -- and
+    the prompt tells the model to report only what differs from it (Hassio-i02);
+    otherwise the raw burst is described on its own. generationConfig pins
+    thinkingBudget=0 (REQUIRED -- otherwise the model spends the whole output
+    budget "thinking" and returns an empty/truncated answer) and asks for JSON
+    matching VISION_SCHEMA. Returns the parsed dict, or None on any failure
+    (network, non-200, unparseable). NEVER logs the request URL or API key (the
+    key rides in the query string): only the HTTP status and a short message tail.
+    """
+    if not frames:
+        return None
+    # label_hint folds the Wyze-reported AI labels into the prompt so the model
+    # has a steer ("the camera's AI flagged: person, package") without us asserting
+    # they're correct -- it still reports what it actually sees.
+    label_hint = f" (the camera's AI flagged: {', '.join(sorted(labels))})" if labels else ""
+    template = VISION_PROMPT_BASELINE if baseline else VISION_PROMPT
+    prompt = template.format(
+        title=title or "camera",
+        interval=VISION_FRAME_INTERVAL,
+        label_hint=label_hint,
+    )
+    parts = [{"text": prompt}]
+    if baseline:
+        # Interleave labels so the model knows which image is the background vs the
+        # live event (Gemini honours text parts placed between images).
+        parts.append({"text": "Background reference (normal empty scene):"})
+        parts.append(_image_part(baseline))
+        parts.append({"text": "Live event burst frames:"})
+    for jpeg in frames:
+        parts.append(_image_part(jpeg))
+    body = {
+        "contents": [{"role": "user", "parts": parts}],
+        "generationConfig": {
+            "temperature": 0.2,
+            "maxOutputTokens": 600,
+            # Mandatory: without thinkingBudget=0 the 2.5 models burn the entire
+            # output allowance on hidden "thoughts" and return nothing usable.
+            "thinkingConfig": {"thinkingBudget": 0},
+            "responseMimeType": "application/json",
+            "responseSchema": VISION_SCHEMA,
+        },
+    }
+    url = f"{GEMINI_ENDPOINT}/{VISION_MODEL}:generateContent?key={GEMINI_API_KEY}"
+    try:
+        resp = requests.post(url, json=body, timeout=GEMINI_TIMEOUT)
+    except Exception as exc:
+        log(f"vision: gemini request failed ({exc})")
+        return None
+    if resp.status_code != 200:
+        # text[:200] only -- never the URL/key. Gemini errors are short JSON.
+        log(f"vision: gemini http={resp.status_code} {resp.text[:200]}")
+        return None
+    try:
+        payload = resp.json()
+        text = payload["candidates"][0]["content"]["parts"][0]["text"]
+        return json.loads(text)
+    except (KeyError, IndexError, ValueError, TypeError) as exc:
+        log(f"vision: gemini parse error ({exc!r})")
+        return None
+
+
+def vision_task(publisher, key, title, data):
+    """Burst -> Gemini -> MQTT for one event. Best-effort, runs on the executor.
+
+    Steps (any failure logs and returns -- never kills the listener):
+      1. require the MQTT publisher (the sensor rides the same broker);
+      2. debounce -- skip if we analysed this key < VISION_MIN_INTERVAL ago;
+      3. pull a burst, send it to Gemini, publish the structured result to the
+         per-cam discovery sensor.
+    """
+    # The result lands on an MQTT-discovery sensor, so without the publisher there's
+    # nowhere to put it -- skip rather than pay Gemini for an unpublishable answer.
+    if not getattr(publisher, "client", None):
+        return
+    try:
+        now = time.monotonic()
+        last = _vision_last.get(key, 0)
+        if now - last < VISION_MIN_INTERVAL:
+            log(f"vision {key}: debounced ({now - last:.0f}s < {VISION_MIN_INTERVAL}s)")
+            return
+        _vision_last[key] = now
+        frames = event_burst(key)
+        if not frames:
+            log(f"vision {key}: no frames")
+            return
+        # Background reference (Hassio-i02): the cached ambient still, sent so the
+        # model reports only what differs. None until the first periodic cycle has
+        # cached one for this cam -> falls back to describing the raw burst.
+        baseline = load_baseline(key)
+        result = analyze_with_gemini(frames, title, event_labels(data), baseline)
+        if result is None:
+            log(f"vision {key}: no result")
+            return
+        publisher.publish_vision(key, title, result, len(frames))
+        log(f"vision {key}: published ({len(frames)} frame(s)): "
+            f"{str(result.get('summary'))[:80]}")
+    except Exception as exc:
+        # Broad catch by design: a vision failure must never propagate and kill the
+        # event listener. Log and move on.
+        log(f"vision {key} failed: {exc!r}")
+
+
+async def run_event_listener(stop, publisher):
     """Subscribe to HA's `wyze_camera_event` and grab a still per event.
 
     Mirrors wyze-event-catalog/watcher.py's websocket handshake. On each event
     it maps device_name -> stream_key and runs the blocking event_grab on the
     default executor so the websocket stays responsive to ping/pong and stop.
-    Reconnects with exponential backoff 1->60s. Started only when HA_TOKEN is set.
+    When configured it then archives the still (should_archive) and/or runs a
+    Gemini vision burst (should_analyze -> vision_task, publishing to MQTT via
+    `publisher`). Reconnects with exponential backoff 1->60s. Started only when
+    HA_TOKEN is set.
     """
     import websockets
 
@@ -711,6 +1105,16 @@ async def run_event_listener(stop):
                     # archive. Runs after the grab so it copies the freshest file.
                     if should_archive(key, data):
                         await loop.run_in_executor(None, archive_event_still, key)
+                    # Gemini vision (Hassio-5sk): if this cam + event match
+                    # VISION_RULES (and a key+MQTT are configured), pull a burst,
+                    # analyse it and publish to the discovery sensor. Awaited on the
+                    # executor so analyses stay serialised + bounded; vision_task is
+                    # best-effort (its own try/except) so a failure can't drop the ws.
+                    if should_analyze(key, data):
+                        await loop.run_in_executor(
+                            None, vision_task, publisher,
+                            key, data.get("device_name"), data,
+                        )
         except Exception as exc:
             if stop["flag"]:
                 break
@@ -725,6 +1129,8 @@ async def run_event_listener(stop):
 
 def main():
     os.makedirs(OUT_DIR, exist_ok=True)
+    if VISION_BASELINE:
+        os.makedirs(BASELINE_DIR, exist_ok=True)
     go2rtc = Go2rtc()
     publisher = StatusPublisher()
 
@@ -740,8 +1146,20 @@ def main():
     # shares `stop` and dies on process exit (SIGTERM/SIGINT set stop["flag"]).
     if HA_TOKEN:
         threading.Thread(
-            target=lambda: asyncio.run(run_event_listener(stop)), daemon=True
+            target=lambda: asyncio.run(run_event_listener(stop, publisher)),
+            daemon=True,
         ).start()
+        # Vision is a sub-feature of the event listener: it needs a key AND the
+        # MQTT sensor to land on. Log which of the three states we're in so the
+        # startup line is diagnostic.
+        if not GEMINI_API_KEY:
+            log("vision disabled (GEMINI_API_KEY not set)")
+        elif not publisher.client:
+            log("vision disabled (needs MQTT_HOST/USER/PASS for the result sensor)")
+        else:
+            bg = "background-subtract on" if VISION_BASELINE else "no background ref"
+            log(f"vision enabled ({VISION_MODEL}, {VISION_FRAMES} frames, {bg}, "
+                f"rules={json.dumps(VISION_RULES)})")
     else:
         log("event listener disabled (HA_TOKEN not set)")
 

@@ -131,6 +131,51 @@ the on-disk still the event grab just refreshed).
   actually archive you still need the mount: the fstab `_netdev` mount handles this
   across reboots; after a manual NFS outage, `mount -a` then `docker compose up -d`.
 
+## Gemini vision analysis (Hassio-5sk, optional)
+The event listener can also **describe what the camera saw** and surface it as an
+HA sensor. On a matching `wyze_camera_event`, the sidecar pulls a short
+**multi-frame burst** from the already-warm go2rtc stream (default 4 frames ~1.5s
+apart), sends them in one request to **Gemini** (`gemini-2.5-flash`) for a
+structured description, and publishes the result to an MQTT-discovery sensor
+`sensor.wyze_<key>_vision`. The burst (not a single still) is the point: it lets
+the model report **what CHANGES across the frames** — who moved, in which
+direction, what they were doing — which a lone frame usually misses.
+
+- **Opt-in / secretless default:** active only when `GEMINI_API_KEY` is set **and**
+  the MQTT publisher is configured (the sensor rides the same `dokr` broker). Unset
+  either ⇒ logs `vision disabled …` and the rest of the sidecar is unaffected. Use
+  a **paid-tier** AI Studio key — the free tier trains on your images. Key in macOS
+  Keychain svc `gemini-api-key`, supplied via the gitignored `.env`.
+- **Sensor shape:** state is the **event timestamp** (`device_class: timestamp`);
+  the description lives in the entity **attributes** — `change_detected` (did
+  anything differ from the background), `summary`, `description`, `motion` (the
+  cross-frame narrative), `people` count, the `*_present` booleans
+  (person/package/vehicle/pet), optional `notable`, plus meta (`camera`, `model`,
+  `frames`, `analyzed_at`). The discovery config is published **once per run**
+  (lazy, on first result); state + attributes are retained so HA shows the last
+  result across restarts.
+- **Recurring-background suppression (Hassio-i02, `VISION_BASELINE=1`, default on):**
+  by default the model would re-describe the *fixed* scene every event (porch, tree,
+  parked car, furniture). Instead, the periodic cycle caches each cam's ambient
+  timer-driven still as a **background reference** (`<OUT_DIR>/baselines/<key>.jpg`),
+  and the burst sends it to Gemini as image 1 with instructions to **ignore anything
+  also in it** and report only what's new/moving/changed — adding a `change_detected`
+  boolean (false + `summary:"no change"` when the burst matches the background). The
+  baseline refreshes every cycle, so it tracks lighting/season; until the first cycle
+  caches one for a cam, that cam falls back to describing the raw burst. Set
+  `VISION_BASELINE=0` to disable.
+- **Configurable cams + event types:** `VISION_RULES` is JSON
+  `{stream_key|"*": [label|"any", …]}` (same shape as `ARCHIVE_RULES`, plus a `"*"`
+  **camera** key matching any cam). Default `{"*": ["any"]}` analyses every camera
+  on every event. Bad JSON logs once and disables vision (fail-safe).
+- **Cost control:** a per-cam debounce `VISION_MIN_INTERVAL` (default 30s) means a
+  motion burst costs **one** analysis, not dozens; byte-identical frames in a burst
+  are de-duplicated before sending. One 4-frame analysis is ~a few tenths of a cent.
+- **Privacy / safety:** the API key rides in the request query string, so the code
+  **never logs the request URL** — only the HTTP status and a short error tail. The
+  vision call runs on an executor and is fully best-effort (its own try/except), so
+  a Gemini outage never drops the websocket or the still-grab/archive paths.
+
 ## Deploy (hassio VM)
 ```bash
 scp -r infra/hassio/wyze-snapshot/ hassio:~/homeassistant/wyze-snapshot/
@@ -141,8 +186,11 @@ ssh hassio 'docker logs -f wyze-snapshot'        # watch the first cycle
 ssh hassio 'ls -l ~/homeassistant/config/wyze_snapshots/'
 ```
 The `.env` is only needed to enable the optional features — the MQTT bridge
-(`MQTT_PASS`) and/or the event-driven grab (`HA_TOKEN`); see `.env.example`. The
-snapshot loop itself needs no secrets.
+(`MQTT_PASS`), the event-driven grab (`HA_TOKEN`), and/or Gemini vision
+(`GEMINI_API_KEY`, which also needs `MQTT_PASS`); see `.env.example`. Append each
+to the same `.env`, e.g. `printf 'GEMINI_API_KEY=%s\n' "$(security
+find-generic-password -a "$USER" -s gemini-api-key -w)" >> .env`. The snapshot loop
+itself needs no secrets.
 
 ## Manage
 ```bash
