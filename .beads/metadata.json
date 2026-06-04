@@ -1,0 +1,8 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "server",
+  "dolt_database": "wsnap",
+  "project_id": "9ee111a1-829b-4dda-94a8-98156d9ef650",
+  "global_dolt_database": "beads_global"
+}

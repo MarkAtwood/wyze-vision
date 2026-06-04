@@ -1,2 +1,9 @@
 .env
 __pycache__/
+.pytest_cache/
+.venv/
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
