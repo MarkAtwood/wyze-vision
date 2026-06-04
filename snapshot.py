@@ -35,6 +35,8 @@ from PIL import Image, ImageDraw, ImageFont
 from wyzeapy.services.camera_service import CameraService
 from wyzeapy.wyze_auth_lib import Token, WyzeAuthLib
 
+import cameras_dashboard
+
 
 # --- config (env-overridable) ------------------------------------------------
 CONFIG_ENTRIES = os.environ.get(
@@ -91,6 +93,25 @@ EVENT_FRAME_ATTEMPTS = int(os.environ.get("EVENT_FRAME_ATTEMPTS", "1"))
 EVENT_LOCK_TIMEOUT = int(os.environ.get("EVENT_LOCK_TIMEOUT", "20"))
 EVENT_WORKERS = int(os.environ.get("EVENT_WORKERS", "3"))
 EVENT_QUEUE_MAX = int(os.environ.get("EVENT_QUEUE_MAX", "64"))
+
+# Optional live dashboard sync: keep a storage-mode "Cameras" dashboard in the
+# HA sidebar continuously in step with the camera roster. A SEPARATE WS task
+# (its own connection, never touching the event listener's hot recv loop)
+# subscribes to HA's state_changed + entity_registry_updated and re-pushes the
+# dashboard via lovelace/config/save -- but ONLY when the discovered
+# roster/online-split SIGNATURE changes, so unchanged state never reloads open
+# viewers. Opt-in via DASH_SYNC; reuses HA_TOKEN, which MUST be an ADMIN token
+# (creating/saving a Lovelace dashboard is admin-only). Off by default, so the
+# sidecar stays secretless and never touches Lovelace unless asked. The dashboard
+# contents come from the shared cameras_dashboard module -- identical output to
+# the deploy/build_cameras_dashboard.py one-shot CLI.
+DASH_SYNC = os.environ.get("DASH_SYNC", "0") not in ("0", "false", "no", "")
+DASH_URL_PATH = os.environ.get("DASH_URL_PATH", "wyze-cameras")
+DASH_TITLE = os.environ.get("DASH_TITLE", "Cameras")
+DASH_ICON = os.environ.get("DASH_ICON", "mdi:cctv")
+# Coalesce a burst of state changes: rebuild/push only after this many seconds
+# of quiet, so a motion flurry triggers at most one push.
+DASH_SYNC_DEBOUNCE = int(os.environ.get("DASH_SYNC_DEBOUNCE", "10"))
 
 # Wyze detection-media fast path: the wyze_camera_event payload carries
 # Wyze's OWN cloud-AI detection screenshot (event_screenshot), captured AT detection
@@ -1329,6 +1350,145 @@ async def run_event_listener(stop, publisher):
     log("event listener: stopped")
 
 
+async def run_dashboard_sync(stop):
+    """Keep the storage-mode "Cameras" dashboard in step with the live roster.
+
+    Runs on a SEPARATE websocket connection from run_event_listener so the event
+    fast-path's recv loop is never touched. On connect it ensures the dashboard
+    exists, subscribes to `state_changed` (filtered to camera.* by
+    cameras_dashboard.is_roster_event) and `entity_registry_updated`, and pushes
+    once. Thereafter a roster-affecting event marks the roster dirty; after
+    DASH_SYNC_DEBOUNCE seconds of quiet it rebuilds from a WS `get_states` and
+    pushes `lovelace/config/save` -- but ONLY when cameras_dashboard.signature
+    differs from the last push, so unchanged state never reloads viewers.
+    Reconnects with exponential backoff 1->60s. Started only when DASH_SYNC is
+    set and HA_TOKEN (an admin token) is present.
+    """
+    import websockets
+
+    next_id = [1]
+    # Shared dirty marker. `since` = monotonic time of the most recent roster
+    # event (None = clean). Mutated both by the idle recv below AND by `cmd`
+    # when an event arrives mid-command, so no roster change is ever swallowed
+    # by a request/response round-trip.
+    dirty = {"since": None}
+
+    async def cmd(ws, payload):
+        """Send a WS command (auto-id) and return its result, marking the roster
+        dirty for any roster event consumed while awaiting the result."""
+        cid = next_id[0]
+        next_id[0] += 1
+        await ws.send(json.dumps({"id": cid, **payload}))
+        while True:
+            msg = json.loads(await ws.recv())
+            if cameras_dashboard.is_roster_event(msg):
+                dirty["since"] = time.monotonic()
+                continue
+            if msg.get("id") == cid and msg.get("type") == "result":
+                return msg
+
+    async def ensure_dashboard(ws):
+        listed = await cmd(ws, {"type": "lovelace/dashboards/list"})
+        if not listed.get("success"):
+            raise RuntimeError(f"dashboards/list failed: {listed.get('error')}")
+        existing = {d.get("url_path") for d in (listed.get("result") or [])}
+        if DASH_URL_PATH in existing:
+            return
+        created = await cmd(ws, {
+            "type": "lovelace/dashboards/create",
+            "url_path": DASH_URL_PATH,
+            "mode": "storage",
+            "title": DASH_TITLE,
+            "icon": DASH_ICON,
+            "show_in_sidebar": True,
+            "require_admin": False,
+        })
+        if not created.get("success"):
+            raise RuntimeError(f"dashboards/create failed: {created.get('error')}")
+        log(f"dashboard sync: created '{DASH_URL_PATH}'")
+
+    async def rebuild_and_push(ws, last_sig):
+        states = await cmd(ws, {"type": "get_states"})
+        cams = cameras_dashboard.discover_cameras(states.get("result") or [])
+        sig = cameras_dashboard.signature(cams)
+        if sig == last_sig:
+            return last_sig
+        config = cameras_dashboard.build_dashboard_config(cams, title=DASH_TITLE)
+        saved = await cmd(ws, {
+            "type": "lovelace/config/save",
+            "url_path": DASH_URL_PATH,
+            "config": config,
+        })
+        if not saved.get("success"):
+            raise RuntimeError(f"config/save failed: {saved.get('error')}")
+        live = sum(1 for c in cams if c["online"])
+        log(f"dashboard sync: pushed {len(cams)} cameras "
+            f"({live} live, {len(cams) - live} offline)")
+        return sig
+
+    backoff = 1
+    last_sig = None
+    while not stop["flag"]:
+        try:
+            async with websockets.connect(
+                HA_URL, max_size=None, ping_interval=20
+            ) as ws:
+                msg = json.loads(await ws.recv())
+                if msg.get("type") != "auth_required":
+                    raise RuntimeError(f"unexpected first frame: {msg}")
+                await ws.send(json.dumps({"type": "auth", "access_token": HA_TOKEN}))
+                msg = json.loads(await ws.recv())
+                if msg.get("type") != "auth_ok":
+                    raise RuntimeError(f"auth failed: {msg}")
+                log("dashboard sync: authenticated")
+
+                await ensure_dashboard(ws)
+                for event_type in ("state_changed", "entity_registry_updated"):
+                    sub = await cmd(ws, {
+                        "type": "subscribe_events", "event_type": event_type,
+                    })
+                    if not sub.get("success"):
+                        raise RuntimeError(f"subscribe {event_type} failed: {sub}")
+                log("dashboard sync: subscribed (state_changed [camera.*], "
+                    "entity_registry_updated)")
+                backoff = 1
+
+                # Initial push, then watch. dirty is reset AFTER the first push
+                # so any change that landed during connect/subscribe still fires.
+                last_sig = await rebuild_and_push(ws, last_sig)
+                dirty["since"] = None
+
+                while not stop["flag"]:
+                    try:
+                        raw = await asyncio.wait_for(ws.recv(), timeout=2)
+                    except asyncio.TimeoutError:
+                        raw = None
+                    if raw is not None:
+                        msg = json.loads(raw)
+                        if cameras_dashboard.is_roster_event(msg):
+                            dirty["since"] = time.monotonic()
+                    if dirty["since"] is not None and (
+                        time.monotonic() - dirty["since"] >= DASH_SYNC_DEBOUNCE
+                    ):
+                        dirty["since"] = None
+                        try:
+                            last_sig = await rebuild_and_push(ws, last_sig)
+                        except Exception as exc:
+                            # A rebuild/push failure must never kill the watcher;
+                            # log and keep watching (next change retries).
+                            log(f"dashboard sync: push failed ({exc!r})")
+        except Exception as exc:
+            if stop["flag"]:
+                break
+            log(f"dashboard sync: connection error ({exc}); retry in {backoff}s")
+            for _ in range(backoff):
+                if stop["flag"]:
+                    break
+                await asyncio.sleep(1)
+            backoff = min(backoff * 2, 60)
+    log("dashboard sync: stopped")
+
+
 def main():
     os.makedirs(OUT_DIR, exist_ok=True)
     if VISION_BASELINE:
@@ -1364,6 +1524,19 @@ def main():
                 f"rules={json.dumps(VISION_RULES)})")
     else:
         log("event listener disabled (HA_TOKEN not set)")
+
+    # Optional live dashboard sync: a SEPARATE WS task (own connection) that
+    # keeps the "Cameras" dashboard in step with the camera roster. Opt-in via
+    # DASH_SYNC and admin-gated; reuses HA_TOKEN. Off by default.
+    if DASH_SYNC and HA_TOKEN:
+        threading.Thread(
+            target=lambda: asyncio.run(run_dashboard_sync(stop)),
+            daemon=True,
+        ).start()
+        log(f"dashboard sync enabled (-> '{DASH_URL_PATH}', "
+            f"debounce={DASH_SYNC_DEBOUNCE}s)")
+    elif DASH_SYNC:
+        log("dashboard sync disabled (needs HA_TOKEN, an admin token)")
 
     log(f"wyze-snapshot starting (refresh={REFRESH_SECONDS}s, out={OUT_DIR})")
     try:

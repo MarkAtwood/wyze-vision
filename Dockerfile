@@ -14,6 +14,9 @@ RUN pip install --no-cache-dir --break-system-packages -r /app/requirements.txt
 
 WORKDIR /app
 COPY snapshot.py /app/snapshot.py
+# Pure dashboard-build logic imported by snapshot.py's optional live dashboard
+# sync (DASH_SYNC); shared with the deploy/build_cameras_dashboard.py CLI.
+COPY cameras_dashboard.py /app/cameras_dashboard.py
 
 ENV PYTHONUNBUFFERED=1
 

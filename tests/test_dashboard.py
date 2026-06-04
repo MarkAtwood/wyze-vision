@@ -5,6 +5,7 @@ No network: these exercise camera discovery from a /api/states payload, the
 online/offline split, title derivation, the URL helper, and Lovelace config
 assembly -- all pure transforms of their arguments.
 """
+import cameras_dashboard as cd
 from deploy import build_cameras_dashboard as bcd
 
 
@@ -37,29 +38,29 @@ def test_ws_url_from_already_ws_path():
 def test_title_strips_wyze_and_snapshot():
     s = _state("camera.wyze_front_door_snapshot",
                friendly_name="Wyze Front Door Snapshot")
-    assert bcd._title_from(s, "front_door") == "Front Door"
+    assert cd._title_from(s, "front_door") == "Front Door"
 
 
 def test_title_falls_back_to_key():
     s = _state("camera.wyze_side_gate_snapshot")
-    assert bcd._title_from(s, "side_gate") == "Side Gate"
+    assert cd._title_from(s, "side_gate") == "Side Gate"
 
 
 # --- online heuristic --------------------------------------------------------
 
 def test_is_online_true_for_active_states():
-    assert bcd._is_online("idle")
-    assert bcd._is_online("streaming")
+    assert cd._is_online("idle")
+    assert cd._is_online("streaming")
 
 
 def test_is_online_false_for_offline_states():
-    assert not bcd._is_online("unavailable")
-    assert not bcd._is_online("off")
-    assert not bcd._is_online("UNKNOWN")  # case-insensitive
+    assert not cd._is_online("unavailable")
+    assert not cd._is_online("off")
+    assert not cd._is_online("UNKNOWN")  # case-insensitive
 
 
 def test_is_online_missing_live_defaults_true():
-    assert bcd._is_online(None)
+    assert cd._is_online(None)
 
 
 # --- discover_cameras --------------------------------------------------------
@@ -74,7 +75,7 @@ def test_discover_cameras_splits_and_maps():
         _state("camera.garage", state="unavailable"),
         _state("sensor.something_else"),  # ignored
     ]
-    cams = bcd.discover_cameras(states)
+    cams = cd.discover_cameras(states)
     assert [c["key"] for c in cams] == ["front_door", "garage"]
 
     fd = cams[0]
@@ -93,7 +94,7 @@ def test_discover_cameras_missing_live_taps_snapshot():
                friendly_name="Wyze Attic Snapshot"),
         # no camera.attic
     ]
-    cams = bcd.discover_cameras(states)
+    cams = cd.discover_cameras(states)
     assert len(cams) == 1
     # Tap-through falls back to the snapshot entity when no live cam exists.
     assert cams[0]["live"] == "camera.wyze_attic_snapshot"
@@ -113,7 +114,7 @@ def _cam(key, online, live=None):
 
 
 def test_build_config_top_level_shape():
-    cfg = bcd.build_dashboard_config([_cam("front_door", True)], title="Cameras")
+    cfg = cd.build_dashboard_config([_cam("front_door", True)], title="Cameras")
     assert cfg["title"] == "Cameras"
     assert len(cfg["views"]) == 1
     view = cfg["views"][0]
@@ -125,7 +126,7 @@ def test_build_config_top_level_shape():
 
 def test_build_config_live_and_offline_bands():
     cams = [_cam("front_door", True), _cam("garage", False)]
-    root = bcd.build_dashboard_config(cams)["views"][0]["cards"][0]["cards"]
+    root = cd.build_dashboard_config(cams)["views"][0]["cards"][0]["cards"]
     headings = [c["content"] for c in root if c.get("type") == "markdown"]
     assert "## Live cameras" in headings
     assert "## Offline cameras" in headings
@@ -142,7 +143,7 @@ def test_build_config_live_and_offline_bands():
 
 def test_build_config_omits_empty_offline_band():
     cams = [_cam("front_door", True)]
-    root = bcd.build_dashboard_config(cams)["views"][0]["cards"][0]["cards"]
+    root = cd.build_dashboard_config(cams)["views"][0]["cards"][0]["cards"]
     headings = [c["content"] for c in root if c.get("type") == "markdown"]
     assert "## Live cameras" in headings
     assert "## Offline cameras" not in headings
@@ -150,8 +151,64 @@ def test_build_config_omits_empty_offline_band():
 
 def test_build_config_picture_glance_shape():
     cams = [_cam("front_door", True)]
-    root = bcd.build_dashboard_config(cams)["views"][0]["cards"][0]["cards"]
+    root = cd.build_dashboard_config(cams)["views"][0]["cards"][0]["cards"]
     grid = [c for c in root if c.get("type") == "grid"][0]
     card = grid["cards"][0]
     assert card["type"] == "picture-glance"
     assert card["entities"] == []  # required by the picture-glance schema
+
+
+# --- signature (live-sync change detection) ---------------------------------
+
+def test_signature_stable_for_identical_rosters():
+    a = [_cam("front_door", True), _cam("garage", False)]
+    b = [_cam("front_door", True), _cam("garage", False)]
+    assert cd.signature(a) == cd.signature(b)
+
+
+def test_signature_changes_on_online_flip():
+    before = cd.signature([_cam("front_door", True)])
+    after = cd.signature([_cam("front_door", False)])
+    assert before != after
+
+
+def test_signature_changes_on_roster_change():
+    one = cd.signature([_cam("front_door", True)])
+    two = cd.signature([_cam("front_door", True), _cam("garage", True)])
+    assert one != two
+
+
+def test_signature_changes_on_title_change():
+    base = _cam("front_door", True)
+    renamed = dict(base, title="Porch")
+    assert cd.signature([base]) != cd.signature([renamed])
+
+
+# --- is_roster_event (live-sync event filter) -------------------------------
+
+def _event(event_type, **data):
+    return {"type": "event",
+            "event": {"event_type": event_type, "data": data}}
+
+
+def test_roster_event_true_for_camera_state_change():
+    assert cd.is_roster_event(_event("state_changed", entity_id="camera.garage"))
+
+
+def test_roster_event_false_for_noncamera_state_change():
+    assert not cd.is_roster_event(
+        _event("state_changed", entity_id="sensor.kitchen_temp"))
+
+
+def test_roster_event_true_for_registry_update():
+    assert cd.is_roster_event(
+        _event("entity_registry_updated", action="create",
+               entity_id="camera.wyze_porch_snapshot"))
+
+
+def test_roster_event_false_for_non_event_message():
+    assert not cd.is_roster_event({"type": "result", "id": 7, "success": True})
+
+
+def test_roster_event_false_for_unrelated_event():
+    assert not cd.is_roster_event(_event("call_service"))

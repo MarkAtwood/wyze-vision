@@ -53,6 +53,18 @@ services:
       - EVENT_FRAME_TIMEOUT=8
       - EVENT_FRAME_ATTEMPTS=1
       - EVENT_LOCK_TIMEOUT=20
+      # Optional live dashboard sync: keep a storage-mode "Cameras" dashboard in
+      # the HA sidebar continuously in step with the camera roster. A separate WS
+      # task subscribes to HA's state_changed + entity_registry_updated and
+      # re-pushes the dashboard ONLY when the roster/online-split changes, so you
+      # never re-run deploy/build_cameras_dashboard.py by hand. Reuses HA_TOKEN,
+      # which MUST be an ADMIN token (creating/saving a Lovelace dashboard is
+      # admin-only). Off by default (DASH_SYNC=0); set DASH_SYNC=1 to enable.
+      - DASH_SYNC=0
+      - DASH_URL_PATH=wyze-cameras
+      - DASH_TITLE=Cameras
+      - DASH_ICON=mdi:cctv
+      - DASH_SYNC_DEBOUNCE=10
       # Wyze detection-media fast path: the wyze_camera_event payload carries
       # Wyze's OWN cloud-AI screenshot (event_screenshot), captured AT detection
       # time, so it contains the subject -- unlike a live go2rtc grab taken

@@ -258,7 +258,7 @@ so deploying is just copying the build context to the host that runs your Home
 Assistant container, then bringing it up:
 ```bash
 # from the root of this repo (HA_HOST = the host running Home Assistant):
-scp Dockerfile requirements.txt snapshot.py docker-compose.yml \
+scp Dockerfile requirements.txt snapshot.py cameras_dashboard.py docker-compose.yml \
     user@HA_HOST:~/wyze-vision/
 # (optional) enable the MQTT bridge / event grab / Gemini vision: write the
 # secrets to a gitignored .env on the host (see .env.example):
@@ -268,31 +268,38 @@ ssh user@HA_HOST 'docker logs -f wyze-vision'   # watch the first cycle
 ```
 The HA-side artifacts under `deploy/` (`provision_local_file_cameras.sh`,
 `build_cameras_dashboard.py`, `cameras-dashboard.yaml`, `hide_live_wyze_cams.sh`)
-configure the HA side and are not part of the container build. The container only
-writes JPEGs; it never touches Home Assistant's Lovelace config. First create the
-camera entities, then build the dashboard one of two ways:
+configure the HA side and are not part of the container build. First create the
+camera entities (`deploy/provision_local_file_cameras.sh` creates the `local_file`
+`camera.wyze_<key>_snapshot` entities that read those JPEGs — run it once with an
+admin token), then build the **"Cameras" dashboard** one of three ways. The live-sync
+and one-shot options both push a **storage-mode** dashboard with its own sidebar entry
+(`url_path` `wyze-cameras`), so they never touch your main/overview dashboard, and both
+read online/offline from each live `camera.<key>`: a cam whose live entity reports
+`unavailable`/`off`/`unknown` goes to the Offline band, while one with no live entity
+at all defaults to Live (its still tile still renders).
 
-- `deploy/provision_local_file_cameras.sh` creates the `local_file` camera entities
-  (`camera.wyze_<key>_snapshot`) that read those JPEGs. Run it once (admin token).
+**Live sync from the sidecar (recommended).**
+Set `DASH_SYNC=1` in `docker-compose.yml` (the sidecar's `HA_TOKEN` must be an
+**admin** token — creating/saving a dashboard is admin-only). A separate WebSocket
+task subscribes to HA's `state_changed` + `entity_registry_updated` and re-pushes the
+dashboard automatically whenever the camera roster or its online/offline split changes
+— debounced (`DASH_SYNC_DEBOUNCE`, default 10s) and pushed only on a *real* change, so
+open viewers reload only when something actually moved. This is the **one** path where
+the container writes Lovelace config, and it is opt-in (off by default; otherwise the
+sidecar only writes JPEGs). Tune with `DASH_URL_PATH` / `DASH_TITLE` / `DASH_ICON`.
 
-**Build the dashboard automatically (recommended).**
-`deploy/build_cameras_dashboard.py` discovers your real `camera.wyze_<key>_snapshot`
-tiles from HA's `/api/states`, splits them Live/Offline by each live `camera.<key>`
-state, and pushes a **storage-mode "Cameras" dashboard** into the HA sidebar over the
-WebSocket API — no `configuration.yaml` edit, no restart, no placeholder editing:
+**One-shot CLI.**
+`deploy/build_cameras_dashboard.py` does the same discovery + push once, then exits —
+handy for a first run or a one-off rebuild without enabling the sidecar task. Run it
+from the repo root **as a module** (so its `cameras_dashboard` import resolves):
 ```bash
 HA_URL=http://homeassistant.local:8123 HA_TOKEN=<admin-token> \
-  .venv/bin/python deploy/build_cameras_dashboard.py
+  .venv/bin/python -m deploy.build_cameras_dashboard
 ```
-It creates a **named** dashboard (`url_path` `wyze-cameras`, its own sidebar entry),
-so it never touches your main/overview dashboard. It is idempotent — re-run it
-whenever your cameras change and it **overwrites** that dashboard's config.
-Requires an **admin** long-lived token (creating a dashboard is admin-only) and the
-`websockets` package (`pip install websockets`, already pinned in `requirements.txt`).
-Online/offline is read from each live `camera.<key>` at push time: a cam whose live
-entity reports `unavailable`/`off`/`unknown` goes to the Offline band, while one with
-no live entity at all defaults to Live (its still tile still renders). Override the
-defaults with `DASH_URL_PATH` / `DASH_TITLE` / `DASH_ICON`.
+It is idempotent — re-run it whenever your cameras change and it **overwrites** that
+dashboard's config. Needs the `websockets` package (already pinned in
+`requirements.txt`) and honours the same `DASH_URL_PATH` / `DASH_TITLE` / `DASH_ICON`
+overrides.
 
 **Or hand-edit a YAML dashboard.**
 `deploy/cameras-dashboard.yaml` is a **static example** — copy it to
