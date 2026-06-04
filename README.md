@@ -6,6 +6,12 @@ still the instant a camera fires an event, archives selected event stills to a
 durable share, and (optionally) describes what each camera saw using Google
 Gemini vision — surfacing it all on a Home Assistant dashboard.
 
+> **Requires the [`ha-wyzeapi`](https://github.com/SecKatie/ha-wyzeapi) integration.**
+> wyze-vision does **not** log into Wyze itself — it builds on `ha-wyzeapi`, which
+> must already be installed and signed in to your Wyze account in Home Assistant.
+> That integration holds your Wyze login; this sidecar only reads the tokens it
+> stored. See [Prerequisites & credentials](#prerequisites--credentials).
+
 Periodically writes a still JPEG for every **online** Wyze camera to
 `/config/wyze_snapshots/<cam>.jpg`, pulled over the Amazon Kinesis Video Streams
 (KVS) WebRTC **cloud** path via go2rtc. This is often the only reliable Wyze
@@ -18,6 +24,33 @@ The JPEGs are surfaced into HA as `local_file` cameras (provisioned by
 (`deploy/cameras-dashboard.yaml`). `local_file` re-reads the file every request,
 so a tile always shows the **last-good** frame and never greys out when KVS creds
 rotate.
+
+## Prerequisites & credentials
+**Where do I log into Wyze?** You don't — not in this sidecar. wyze-vision is a
+**companion to the [`ha-wyzeapi`](https://github.com/SecKatie/ha-wyzeapi)
+integration**, which must already be installed and signed in to your Wyze account
+in Home Assistant. That integration is the **only** place your Wyze email +
+password (+ 2FA) are entered, and it's a hard prerequisite — wyze-vision also
+relies on the `wyze_camera_event` bus event that `ha-wyzeapi` fires.
+
+**Where is the Wyze password kept?** Not here, and not by this sidecar at all.
+`ha-wyzeapi` performs the login; Home Assistant stores the resulting Wyze OAuth
+**access/refresh tokens** (not the password) in
+`/config/.storage/core.config_entries`. wyze-vision mounts HA's config dir
+(`../config:/config` in `docker-compose.yml`) and **reads those tokens** at
+runtime (`CONFIG_ENTRIES=/config/.storage/core.config_entries`). No Wyze
+credential is ever entered into, logged by, or stored in this repo, its `.env`, or
+its environment.
+
+**The only secrets wyze-vision itself takes** are optional feature-gates, kept in a
+gitignored `.env` on the host (never committed; see `.env.example`) — and **none of
+them is a Wyze credential**:
+- `MQTT_PASS` — your broker password, enabling the conn-state bridge + vision sensor.
+- `HA_TOKEN` — a Home Assistant long-lived access token, enabling the event-driven grab.
+- `GEMINI_API_KEY` — a Google AI Studio key, enabling Gemini vision.
+
+Leave any of them unset and that feature disables itself; with none set, the
+sidecar runs **secretless** (periodic stills only).
 
 ## How it works
 One container (built `FROM alexxit/go2rtc`, which already bundles the static
@@ -238,6 +271,18 @@ ssh user@HA_HOST 'docker logs -f wyze-vision'   # watch the first cycle
 The HA-side artifacts (`cameras-dashboard.yaml`, `hide_live_wyze_cams.sh`,
 `provision_local_file_cameras.sh`) live under `deploy/` — they configure the HA
 side and are not part of the container build.
+
+**The dashboard is not auto-built.** The container only writes JPEGs; it never
+touches Home Assistant's Lovelace config. Wiring up the "Cameras" view is a manual,
+one-time HA-side step:
+- `deploy/provision_local_file_cameras.sh` creates the `local_file` camera entities
+  (`camera.wyze_<key>_snapshot`) that read those JPEGs.
+- `deploy/cameras-dashboard.yaml` is a **static, hand-edited example** dashboard —
+  copy it to `/config/dashboards/cameras.yaml` and reference it from
+  `configuration.yaml` under `lovelace: dashboards:`. The camera keys in it are
+  **placeholders** (`front_door`, `driveway`, …) you replace with your own, and the
+  Live/Offline split is the last-known state when you write the file (a live split
+  would need the `auto-entities` custom card).
 
 ## Development / tests
 The pure logic (stream-key/URL normalization, event-label matching, archive/vision
