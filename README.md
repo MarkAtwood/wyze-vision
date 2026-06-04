@@ -6,11 +6,9 @@ still the instant a camera fires an event, archives selected event stills to a
 durable share, and (optionally) describes what each camera saw using Google
 Gemini vision — surfacing it all on a Home Assistant dashboard.
 
-> **Requires the [`ha-wyzeapi`](https://github.com/SecKatie/ha-wyzeapi) integration.**
-> wyze-vision does **not** log into Wyze itself — it builds on `ha-wyzeapi`, which
-> must already be installed and signed in to your Wyze account in Home Assistant.
-> That integration holds your Wyze login; this sidecar only reads the tokens it
-> stored. See [Prerequisites & credentials](#prerequisites--credentials).
+> **Requires the [`ha-wyzeapi`](https://github.com/SecKatie/ha-wyzeapi)
+> integration** — that's where you sign in to Wyze. See
+> [Prerequisites & credentials](#prerequisites--credentials).
 
 Periodically writes a still JPEG for every **online** Wyze camera to
 `/config/wyze_snapshots/<cam>.jpg`, pulled over the Amazon Kinesis Video Streams
@@ -268,12 +266,11 @@ ssh user@HA_HOST 'umask 077; printf "MQTT_PASS=%s\n" "<broker-pw>" > ~/wyze-visi
 ssh user@HA_HOST 'cd ~/wyze-vision && docker compose up -d --build'
 ssh user@HA_HOST 'docker logs -f wyze-vision'   # watch the first cycle
 ```
-The HA-side artifacts (`cameras-dashboard.yaml`, `hide_live_wyze_cams.sh`,
-`provision_local_file_cameras.sh`) live under `deploy/` — they configure the HA
-side and are not part of the container build.
-
-The container only writes JPEGs; it never touches Home Assistant's Lovelace
-config. First create the camera entities, then build the dashboard one of two ways:
+The HA-side artifacts under `deploy/` (`provision_local_file_cameras.sh`,
+`build_cameras_dashboard.py`, `cameras-dashboard.yaml`, `hide_live_wyze_cams.sh`)
+configure the HA side and are not part of the container build. The container only
+writes JPEGs; it never touches Home Assistant's Lovelace config. First create the
+camera entities, then build the dashboard one of two ways:
 
 - `deploy/provision_local_file_cameras.sh` creates the `local_file` camera entities
   (`camera.wyze_<key>_snapshot`) that read those JPEGs. Run it once (admin token).
@@ -292,8 +289,9 @@ so it never touches your main/overview dashboard. It is idempotent — re-run it
 whenever your cameras change and it **overwrites** that dashboard's config.
 Requires an **admin** long-lived token (creating a dashboard is admin-only) and the
 `websockets` package (`pip install websockets`, already pinned in `requirements.txt`).
-Online/offline is read from each live `camera.<key>` at push time (a cam whose live
-entity is `unavailable`/`off`/`unknown`, or absent, lands accordingly). Override the
+Online/offline is read from each live `camera.<key>` at push time: a cam whose live
+entity reports `unavailable`/`off`/`unknown` goes to the Offline band, while one with
+no live entity at all defaults to Live (its still tile still renders). Override the
 defaults with `DASH_URL_PATH` / `DASH_TITLE` / `DASH_ICON`.
 
 **Or hand-edit a YAML dashboard.**
