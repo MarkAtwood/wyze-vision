@@ -1,0 +1,8 @@
+# Runtime dependencies, pinned to the versions deployed in the container
+# (captured from `docker exec wyze-vision pip freeze`). requests/Pillow/
+# wyzeapy are imported at module top; paho-mqtt/websockets are imported lazily.
+wyzeapy==0.5.33
+requests==2.34.2
+Pillow==12.2.0
+paho-mqtt==2.1.0
+websockets==16.0

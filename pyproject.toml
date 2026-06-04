@@ -1,0 +1,5 @@
+# This is an application (a single-purpose sidecar), not a library, so there is
+# no [build-system]. The only config here is for the test runner.
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
