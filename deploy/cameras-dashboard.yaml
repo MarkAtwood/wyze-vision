@@ -1,7 +1,7 @@
 # Cameras dashboard: Wyze event log + still tiles -> tap a tile for live WebRTC.
 #
 # Wired into the sidebar via `lovelace: dashboards:` in configuration.yaml.
-# Deployed to /config/dashboards/cameras.yaml on the hassio VM.
+# Deployed to /config/dashboards/cameras.yaml on the HA host.
 #
 # LAYOUT: a PANEL view (`panel: true`) whose single root card is a vertical-stack
 # of three full-width bands:
@@ -11,7 +11,7 @@
 #      first) on the RIGHT.
 #   2. Live cameras      -- the cams that were online (grid, 3 per row).
 #   3. Offline cameras   -- the cams that were offline (grid, 3 per row); dark
-#      "offline since" placeholder rendered by the wyze-snapshot sidecar.
+#      "offline since" placeholder rendered by the wyze-vision sidecar.
 #
 # WHY panel + vertical-stack + grid (the third attempt):
 #   * masonry top-level cards tile full-width and LARGE, but masonry has no hard
@@ -22,8 +22,8 @@
 #   * a PANEL view renders its single root card EDGE-TO-EDGE with no ~500px cap,
 #     so a `grid` card placed inside fills the FULL dashboard width and tiles its
 #     cameras large -- while the vertical-stack stacks the three bands. The tiny-
-#     tile bug (Hassio-0gk) only happens when a grid is trapped inside one ~500px
-#     masonry column; here the grid owns the full width.
+#     tile bug only happens when a grid is trapped inside one ~500px masonry
+#     column; here the grid owns the full width.
 #   NOTE: panel mode shows only the FIRST card of the view, so EVERYTHING must
 #   live under the single root vertical-stack.
 #
@@ -31,14 +31,14 @@
 # as the image source when it is a camera and IGNORES camera_image; the live
 # ha-wyzeapi cams return HTTP 500 on /api/camera_proxy (WebRTC-only, no still
 # JPEG), blanking every tile. picture-glance feeds camera_image (the reliable
-# local_file still from the wyze-snapshot sidecar) straight to the image
+# local_file still from the wyze-vision sidecar) straight to the image
 # renderer, while `entity` (the live WebRTC cam) is the tap -> more-info target.
 # `entities: []` is required by the picture-glance schema (empty list is valid).
 # grid `square: false` keeps the camera image aspect ratio (no square crop).
 #
 # NOTE: the Live/Offline split is STATIC (membership = last-known state when this
 # file was written). A live split would need a custom auto-entities card, which
-# is not installed.
+# is not installed. The camera keys below are EXAMPLES -- replace them with yours.
 title: Cameras
 views:
   - title: Wyze
@@ -111,59 +111,59 @@ views:
                 camera_image: camera.wyze_front_door_snapshot
                 entities: []
               - type: picture-glance
+                title: Driveway
+                entity: camera.driveway
+                camera_image: camera.wyze_driveway_snapshot
+                entities: []
+              - type: picture-glance
+                title: Backyard
+                entity: camera.backyard
+                camera_image: camera.wyze_backyard_snapshot
+                entities: []
+              - type: picture-glance
+                title: Garage
+                entity: camera.garage
+                camera_image: camera.wyze_garage_snapshot
+                entities: []
+              - type: picture-glance
                 title: Garden
                 entity: camera.garden
                 camera_image: camera.wyze_garden_snapshot
                 entities: []
               - type: picture-glance
-                title: Catio
-                entity: camera.catio
-                camera_image: camera.wyze_catio_snapshot
+                title: Porch
+                entity: camera.porch
+                camera_image: camera.wyze_porch_snapshot
                 entities: []
               - type: picture-glance
-                title: Studio
-                entity: camera.studio
-                camera_image: camera.wyze_studio_snapshot
+                title: Side Gate
+                entity: camera.side_gate
+                camera_image: camera.wyze_side_gate_snapshot
                 entities: []
               - type: picture-glance
-                title: Shop
-                entity: camera.shop
-                camera_image: camera.wyze_shop_snapshot
+                title: Patio
+                entity: camera.patio
+                camera_image: camera.wyze_patio_snapshot
                 entities: []
               - type: picture-glance
-                title: Toolbox
-                entity: camera.toolbox
-                camera_image: camera.wyze_toolbox_snapshot
+                title: Shed
+                entity: camera.shed
+                camera_image: camera.wyze_shed_snapshot
                 entities: []
               - type: picture-glance
-                title: Roundabout
-                entity: camera.roundabout
-                camera_image: camera.wyze_roundabout_snapshot
+                title: Greenhouse
+                entity: camera.greenhouse
+                camera_image: camera.wyze_greenhouse_snapshot
                 entities: []
               - type: picture-glance
-                title: Cat Flap
-                entity: camera.cat_flap
-                camera_image: camera.wyze_cat_flap_snapshot
+                title: Front Walk
+                entity: camera.front_walk
+                camera_image: camera.wyze_front_walk_snapshot
                 entities: []
               - type: picture-glance
-                title: 3D Printer
-                entity: camera.3d_printer
-                camera_image: camera.wyze_3d_printer_snapshot
-                entities: []
-              - type: picture-glance
-                title: Garden Meadow
-                entity: camera.garden_meadow
-                camera_image: camera.wyze_garden_meadow_snapshot
-                entities: []
-              - type: picture-glance
-                title: Greenhouse North
-                entity: camera.greenhouse_north
-                camera_image: camera.wyze_greenhouse_north_snapshot
-                entities: []
-              - type: picture-glance
-                title: Outside Studio
-                entity: camera.outside_studio
-                camera_image: camera.wyze_outside_studio_snapshot
+                title: Carport
+                entity: camera.carport
+                camera_image: camera.wyze_carport_snapshot
                 entities: []
           # --- Band 3: Offline cameras ---
           - type: markdown
@@ -173,42 +173,42 @@ views:
             square: false
             cards:
               - type: picture-glance
-                title: Tammy
-                entity: camera.tammy
-                camera_image: camera.wyze_tammy_snapshot
+                title: Basement
+                entity: camera.basement
+                camera_image: camera.wyze_basement_snapshot
                 entities: []
               - type: picture-glance
-                title: TBD
-                entity: camera.tbd
-                camera_image: camera.wyze_tbd_snapshot
+                title: Workshop
+                entity: camera.workshop
+                camera_image: camera.wyze_workshop_snapshot
                 entities: []
               - type: picture-glance
-                title: Back Yard Cam
-                entity: camera.back_yard_cam
-                camera_image: camera.wyze_back_yard_cam_snapshot
+                title: Pool
+                entity: camera.pool
+                camera_image: camera.wyze_pool_snapshot
                 entities: []
               - type: picture-glance
-                title: Sprouting Shed 1
-                entity: camera.sprouting_shed_1
-                camera_image: camera.wyze_sprouting_shed_1_snapshot
+                title: Mailbox
+                entity: camera.mailbox
+                camera_image: camera.wyze_mailbox_snapshot
                 entities: []
               - type: picture-glance
-                title: Sprouting Shed 2
-                entity: camera.sprouting_shed_2
-                camera_image: camera.wyze_sprouting_shed_2_snapshot
+                title: Side Yard
+                entity: camera.side_yard
+                camera_image: camera.wyze_side_yard_snapshot
                 entities: []
               - type: picture-glance
-                title: Garden Pan
-                entity: camera.garden_pan
-                camera_image: camera.wyze_garden_pan_snapshot
+                title: Balcony
+                entity: camera.balcony
+                camera_image: camera.wyze_balcony_snapshot
                 entities: []
               - type: picture-glance
-                title: Greenhouse
-                entity: camera.greenhouse
-                camera_image: camera.wyze_greenhouse_snapshot
+                title: Deck
+                entity: camera.deck
+                camera_image: camera.wyze_deck_snapshot
                 entities: []
               - type: picture-glance
-                title: Back Greenhouse
-                entity: camera.back_greenhouse
-                camera_image: camera.wyze_back_greenhouse_snapshot
+                title: Courtyard
+                entity: camera.courtyard
+                camera_image: camera.wyze_courtyard_snapshot
                 entities: []

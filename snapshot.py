@@ -1,9 +1,9 @@
-"""Wyze still-image snapshot sidecar (Hassio-8qm).
+"""wyze-vision: Wyze still-image snapshot sidecar.
 
 Periodically pulls a still JPEG from every ONLINE Wyze camera over the Amazon
 Kinesis Video Streams (KVS) WebRTC cloud path -- the only reliable Wyze still
 source here, since every local path is blocked (symmetric NAT / WebRTC-only
-camera_proxy). See memories: wyze-go2rtc-still-proof, go2rtc-supports-kvs-webrtc.
+camera_proxy).
 
 Each cycle:
   1. read the Wyze tokens from HA's core.config_entries (no password needed),
@@ -51,7 +51,7 @@ GO2RTC_SETTLE = int(os.environ.get("GO2RTC_SETTLE", "5"))
 FRAME_TIMEOUT = int(os.environ.get("FRAME_TIMEOUT", "30"))
 FRAME_ATTEMPTS = int(os.environ.get("FRAME_ATTEMPTS", "3"))
 # go2rtc passes this verbatim as the signaling recipientClientId. It does NOT
-# need to match the X-Amz-ClientId in the signaling URL (proven, Hassio-b5l).
+# need to match the X-Amz-ClientId in the signaling URL (verified).
 CLIENT_ID = os.environ.get("CLIENT_ID", "ada06f08-87f4-4e13-b699-e82db8517ae5")
 # Persisted per-camera online history, used to date the "offline since" label.
 STATE_FILE = os.environ.get("STATE_FILE", os.path.join(OUT_DIR, ".offline_state.json"))
@@ -59,14 +59,14 @@ STATE_FILE = os.environ.get("STATE_FILE", os.path.join(OUT_DIR, ".offline_state.
 # Optional MQTT publish of each camera's Wyze cloud connection state, consumed
 # by the device-inventory sidecar to date its Wyze tab "Last Seen" from the
 # durable cloud conn_state_ts instead of HA's restart-pinned last_updated
-# (Hassio-708). Opt-in: the publisher only activates when all of MQTT_HOST,
+# Opt-in: the publisher only activates when all of MQTT_HOST,
 # MQTT_USER and MQTT_PASS are set, so this sidecar stays secretless by default.
 MQTT_HOST = os.environ.get("MQTT_HOST", "")
 MQTT_PORT = int(os.environ.get("MQTT_PORT", "1883"))
 MQTT_USER = os.environ.get("MQTT_USER", "")
 MQTT_PASS = os.environ.get("MQTT_PASS", "")
 
-# Optional event-driven fast path (Hassio-i0w): subscribe to HA's
+# Optional event-driven fast path: subscribe to HA's
 # `wyze_camera_event` bus event and grab a fresh still for that single camera
 # the moment it fires, instead of waiting up to REFRESH_SECONDS for the next
 # periodic cycle. Opt-in: the listener thread starts only when HA_TOKEN is set,
@@ -77,7 +77,7 @@ EVENT_TYPE = os.environ.get("EVENT_TYPE", "wyze_camera_event")
 # Minimum seconds between event grabs for the SAME camera (debounce a motion
 # burst). The periodic cycle is unaffected.
 EVENT_MIN_INTERVAL = int(os.environ.get("EVENT_MIN_INTERVAL", "15"))
-# Resilience to a "sick" camera (Hassio-3hd): a cam whose go2rtc/KVS stream is
+# Resilience to a "sick" camera: a cam whose go2rtc/KVS stream is
 # timing out must not stall the whole event pipeline. Two layers:
 #  (A) the listener hands each event to a bounded queue drained by EVENT_WORKERS
 #      tasks, so ws.recv() never blocks on one cam's grab+burst (which would drop
@@ -92,7 +92,7 @@ EVENT_LOCK_TIMEOUT = int(os.environ.get("EVENT_LOCK_TIMEOUT", "20"))
 EVENT_WORKERS = int(os.environ.get("EVENT_WORKERS", "3"))
 EVENT_QUEUE_MAX = int(os.environ.get("EVENT_QUEUE_MAX", "64"))
 
-# Wyze detection-media fast path (Hassio-zcm): the wyze_camera_event payload carries
+# Wyze detection-media fast path: the wyze_camera_event payload carries
 # Wyze's OWN cloud-AI detection screenshot (event_screenshot), captured AT detection
 # time -- so it contains the subject that triggered the event, unlike a live go2rtc
 # grab taken seconds-to-tens-of-seconds later (ha-wyzeapi polls Wyze every 30s, then
@@ -102,7 +102,7 @@ EVENT_QUEUE_MAX = int(os.environ.get("EVENT_QUEUE_MAX", "64"))
 # grab/burst when it's absent or unfetchable. The URL is self-authenticating via its
 # signed `st` token (NO Wyze access token needed), but Wyze's gateway only honours a
 # recognised client User-Agent and returns a misleading 401 'Access token is invalid.'
-# for unknown/bot UAs (Hassio-2ph) -- so we send EVENT_MEDIA_UA. (event_video is also
+# for unknown/bot UAs -- so we send EVENT_MEDIA_UA. (event_video is also
 # in the payload but is typically a 404 for these cams -- no Cam Plus cloud clip --
 # so only the still is used.) Set EVENT_USE_SCREENSHOT=0 to force the old live grab.
 EVENT_USE_SCREENSHOT = os.environ.get("EVENT_USE_SCREENSHOT", "1") not in (
@@ -111,7 +111,7 @@ EVENT_USE_SCREENSHOT = os.environ.get("EVENT_USE_SCREENSHOT", "1") not in (
 EVENT_MEDIA_UA = os.environ.get("EVENT_MEDIA_UA", "okhttp/4.9.3")
 EVENT_MEDIA_TIMEOUT = int(os.environ.get("EVENT_MEDIA_TIMEOUT", "10"))
 
-# Optional event-still archive (Hassio-5sa / -bp8 / -ud0): on a matching
+# Optional event-still archive: on a matching
 # wyze_camera_event, copy the current on-disk still to a timestamped file under
 # ARCHIVE_DIR/<key>/, pruned to ARCHIVE_RETENTION_DAYS. Which cameras + event
 # types to archive is data-driven via ARCHIVE_RULES (edit the docker-compose env,
@@ -120,13 +120,13 @@ EVENT_MEDIA_TIMEOUT = int(os.environ.get("EVENT_MEDIA_TIMEOUT", "10"))
 ARCHIVE_DIR = os.environ.get("ARCHIVE_DIR", "/archive")
 # Sentinel proving ARCHIVE_DIR is the real mounted ZFS share, not a docker-made
 # empty LOCAL bind dir from an NFS outage. Create it once on the share itself:
-#   touch /mnt/tank/shared/wyze/.archive_root
+#   touch /mnt/nas/wyze/.archive_root
 # Missing marker -> archive disables (logs once) instead of writing to local disk.
 ARCHIVE_MARKER = os.environ.get("ARCHIVE_MARKER", ".archive_root")
 ARCHIVE_RETENTION_DAYS = int(os.environ.get("ARCHIVE_RETENTION_DAYS", "100"))
 
-# Named AI event labels -> the integer tag_list codes Wyze emits (memory
-# wyze-event-tag-list-mapping); ai_tag_list carries the same names. Used to match
+# Named AI event labels -> the integer tag_list codes Wyze emits;
+# ai_tag_list carries the same names. Used to match
 # an event against the labels listed for a camera in ARCHIVE_RULES.
 ARCHIVE_TAG_CODES = {
     "person": "101",
@@ -165,11 +165,11 @@ def _load_archive_rules():
 
 ARCHIVE_RULES = _load_archive_rules()
 
-# Optional Gemini vision analysis (Hassio-5sk): on a matching wyze_camera_event,
+# Optional Gemini vision analysis: on a matching wyze_camera_event,
 # grab a short multi-frame burst from the (already warm) go2rtc stream, send it to
 # Gemini for a structured description, and publish the result to an MQTT-discovery
 # HA sensor (sensor.wyze_<key>_vision). Opt-in: active only when GEMINI_API_KEY is
-# set AND the MQTT publisher is configured (the sensor rides the same dokr broker
+# set AND the MQTT publisher is configured (the sensor rides the same broker
 # HA already consumes), so the sidecar stays secretless by default.
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 VISION_MODEL = os.environ.get("VISION_MODEL", "gemini-2.5-flash")
@@ -190,7 +190,7 @@ VISION_MIN_INTERVAL = int(os.environ.get("VISION_MIN_INTERVAL", "30"))
 # MQTT discovery prefix HA listens on (default 'homeassistant'); the per-cam sensor
 # config is published retained under <prefix>/sensor/wyze_vision_<key>/config.
 VISION_DISCOVERY_PREFIX = os.environ.get("VISION_DISCOVERY_PREFIX", "homeassistant")
-# Recurring-background suppression (Hassio-i02): when on, the periodic cycle caches
+# Recurring-background suppression: when on, the periodic cycle caches
 # each online camera's ambient (timer-driven, usually-empty) still under BASELINE_DIR
 # and the vision burst sends that as a labeled REFERENCE frame, so Gemini reports
 # only what differs from the recurring background instead of re-describing the fixed
@@ -292,7 +292,7 @@ _go2rtc_lock = threading.Lock()
 current_streams = set()
 # key -> monotonic time of the last successful/attempted event grab, for debounce.
 _last_grab = {}
-# Stream keys whose frame grab FAILED in the last periodic cycle (Hassio-3hd).
+# Stream keys whose frame grab FAILED in the last periodic cycle.
 # Maintained by cycle(); read by the event path to skip a known-sick cam instead
 # of discovering it the slow way (a dead KVS stream costs a full fetch budget).
 # Mutated in place (add/discard) so no global declaration is needed.
@@ -394,7 +394,7 @@ async def collect_streams():
     offline = {}
     conn = {}
     for cam in cameras:
-        # Cloud connection state for the MQTT bridge (Hassio-708) -- collected
+        # Cloud connection state for the MQTT bridge -- collected
         # for every camera regardless of whether it yields a usable stream.
         rd = getattr(cam, "raw_dict", None) or {}
         mac = getattr(cam, "mac", "") or ""
@@ -474,7 +474,7 @@ class StatusPublisher:
     `wyze/<mac>/status` message ({"conn_state", "conn_state_ts"}) per camera,
     consumed by the device-inventory sidecar to date its Wyze tab "Last Seen"
     from the durable cloud `conn_state_ts` rather than HA's restart-pinned
-    `last_updated` (Hassio-708). Disabled (no-op) when unconfigured so this
+    `last_updated`. Disabled (no-op) when unconfigured so this
     sidecar stays secretless by default.
     """
 
@@ -578,7 +578,7 @@ def fetch_frame(key, timeout=None, attempts=None):
 
     timeout/attempts default to the patient periodic-cycle budget (FRAME_TIMEOUT x
     FRAME_ATTEMPTS); the event path passes the tighter EVENT_FRAME_* values so a
-    dead stream fails in seconds (Hassio-3hd).
+    dead stream fails in seconds.
     """
     timeout = FRAME_TIMEOUT if timeout is None else timeout
     attempts = FRAME_ATTEMPTS if attempts is None else attempts
@@ -599,7 +599,7 @@ def fetch_frame(key, timeout=None, attempts=None):
 
 
 def _fetch_frame_locked(key):
-    """Event-path frame fetch (Hassio-3hd): grab one JPEG under the go2rtc lock
+    """Event-path frame fetch: grab one JPEG under the go2rtc lock
     using the TIGHT event budget, and bound the wait for the lock itself.
 
     The periodic cycle holds _go2rtc_lock briefly around go2rtc.restart(); a sick
@@ -736,20 +736,20 @@ def cycle(go2rtc, publisher):
             jpeg = fetch_frame(key)
             if jpeg:
                 write_frame(key, jpeg)
-                # Refresh this cam's vision background reference (Hassio-i02). The
+                # Refresh this cam's vision background reference. The
                 # periodic still is timer-driven (no event), so it's our cleanest
                 # ambient frame; updating every cycle tracks lighting/season.
                 write_baseline(key, jpeg)
                 state[key] = {"last_online": now, "offline_since": None}
                 ok += 1
                 # This cam's stream is healthy this cycle -> let the event path
-                # use it again (Hassio-3hd).
+                # use it again.
                 _frame_unhealthy.discard(key)
                 log(f"  wrote {key}.jpg ({len(jpeg)} bytes)")
             else:
                 # Frame grab failed (KVS/go2rtc trouble): mark the cam sick so the
                 # event path skips it until a later cycle recovers it, instead of
-                # spending the full fetch budget on a dead stream (Hassio-3hd).
+                # spending the full fetch budget on a dead stream.
                 _frame_unhealthy.add(key)
     else:
         log("no online cameras this cycle")
@@ -787,8 +787,7 @@ def fetch_event_screenshot(data):
     via its signed `st` query token -- NO Wyze access token is sent. Wyze's gateway
     runs a User-Agent allowlist and answers a misleading 401 'Access token is
     invalid.' for unknown/bot UAs, so we send EVENT_MEDIA_UA (a recognised client
-    UA). We send NO Authorization header (the Azure-blob backend 400s on one). See
-    Hassio-2ph for the reverse-engineering of this auth path.
+    UA). We send NO Authorization header (the Azure-blob backend 400s on one).
     """
     url = (data or {}).get("event_screenshot")
     if not url:
@@ -865,8 +864,8 @@ def event_grab(key):
 def event_labels(data):
     """Set of archive labels a wyze_camera_event payload matches.
 
-    The Cam Plus AI object class rides in tag_list as integer codes (101=Person,
-    memory wyze-event-tag-list-mapping) and/or as named strings in ai_tag_list.
+    The Cam Plus AI object class rides in tag_list as integer codes (101=Person)
+    and/or as named strings in ai_tag_list.
     Returns the lowercased label names (person/pet/vehicle/package) present, by
     matching both the named ai_tag_list and the ARCHIVE_TAG_CODES-mapped tag_list.
     """
@@ -1051,7 +1050,7 @@ def event_burst(key):
         jpeg = _fetch_frame_locked(key)
         if not jpeg:
             # Tight event budget already spent on this frame -> the stream is cold.
-            # Stop the burst rather than waiting it out on a dead feed (Hassio-3hd);
+            # Stop the burst rather than waiting it out on a dead feed;
             # whatever we collected so far still gets analysed.
             log(f"vision burst {key}: stream cold, stopping after {len(frames)} frame(s)")
             break
@@ -1083,7 +1082,7 @@ def analyze_with_gemini(frames, title, labels, baseline=None, boxed=False):
 
     Builds a single multimodal request. When `baseline` (a reference JPEG of the
     empty scene) is supplied, it is sent FIRST -- labeled as the background -- and
-    the prompt tells the model to report only what differs from it (Hassio-i02);
+    the prompt tells the model to report only what differs from it;
     otherwise the raw burst is described on its own. generationConfig pins
     thinkingBudget=0 (REQUIRED -- otherwise the model spends the whole output
     budget "thinking" and returns an empty/truncated answer) and asks for JSON
@@ -1097,7 +1096,7 @@ def analyze_with_gemini(frames, title, labels, baseline=None, boxed=False):
     # has a steer ("the camera's AI flagged: person, package") without us asserting
     # they're correct -- it still reports what it actually sees.
     label_hint = f" (the camera's AI flagged: {', '.join(sorted(labels))})" if labels else ""
-    # box_hint (Hassio-zcm): Wyze's event_screenshot has a GREEN bounding box drawn
+    # box_hint: Wyze's event_screenshot has a GREEN bounding box drawn
     # over the region its detector flagged as moving. Point the model at it so it
     # focuses on the actual trigger, but tell it the box is a software overlay (not a
     # real object) so it isn't described as part of the scene. Live go2rtc fallback
@@ -1163,7 +1162,7 @@ def vision_task(publisher, key, title, data, shot=None):
       2. debounce -- skip if we analysed this key < VISION_MIN_INTERVAL ago;
       3. get frames, send them to Gemini, publish the structured result to the
          per-cam discovery sensor.
-    When `shot` is given (Wyze's own detection screenshot, Hassio-zcm) it is used as
+    When `shot` is given (Wyze's own detection screenshot) it is used as
     the single vision frame -- it was captured AT detection time so it actually
     contains the subject, unlike a live burst grabbed seconds-to-tens-of-seconds
     later. Otherwise we fall back to a live go2rtc burst (event_burst).
@@ -1183,7 +1182,7 @@ def vision_task(publisher, key, title, data, shot=None):
         if not frames:
             log(f"vision {key}: no frames")
             return
-        # Background reference (Hassio-i02): the cached ambient still, sent so the
+        # Background reference: the cached ambient still, sent so the
         # model reports only what differs. None until the first periodic cycle has
         # cached one for this cam -> falls back to describing the raw burst.
         baseline = load_baseline(key)
@@ -1207,13 +1206,13 @@ def vision_task(publisher, key, title, data, shot=None):
 async def run_event_listener(stop, publisher):
     """Subscribe to HA's `wyze_camera_event` and grab a still per event.
 
-    Mirrors wyze-event-catalog/watcher.py's websocket handshake. On each event it
+    Implements HA's websocket auth + event-subscription handshake. On each event it
     maps device_name -> stream_key and ENQUEUES the work; a pool of EVENT_WORKERS
     tasks drains the queue, each running the blocking grab/archive/vision pipeline
     on the default executor. The recv loop itself never blocks, so a sick camera
-    can't stall the listener or drop other cams' events (Hassio-3hd). The per-event
-    pipeline: a detection still -- Wyze's own event_screenshot when present
-    (Hassio-zcm), else a live grab (event_grab) -- then optional archive
+    can't stall the listener or drop other cams' events. The per-event
+    pipeline: a detection still -- Wyze's own event_screenshot when present,
+    else a live grab (event_grab) -- then optional archive
     (should_archive) and/or a Gemini vision read (should_analyze -> vision_task,
     publishing to MQTT via `publisher`). Reconnects with exponential backoff 1->60s;
     workers persist across reconnects. Started only when HA_TOKEN is set.
@@ -1222,7 +1221,7 @@ async def run_event_listener(stop, publisher):
 
     loop = asyncio.get_running_loop()
 
-    # Layer A (Hassio-3hd): the recv loop must NOT block on a camera's grab+burst,
+    # Layer A: the recv loop must NOT block on a camera's grab+burst,
     # or a single sick cam (KVS timing out for minutes) stalls ws.recv() and events
     # for healthy cams that fire in that window are lost. So each event is handed to
     # a bounded queue drained by a small worker pool; the recv loop only enqueues.
@@ -1231,7 +1230,7 @@ async def run_event_listener(stop, publisher):
     async def handle(key, name, data):
         """Per-event pipeline: detection still, then optional archive + vision.
 
-        Hassio-zcm: prefer Wyze's OWN event_screenshot (captured at detection time,
+        Prefer Wyze's OWN event_screenshot (captured at detection time,
         so it contains the subject) as the still and the single vision frame; fall
         back to a live go2rtc grab/burst only when the screenshot is absent. The
         screenshot is fetched ONCE here and reused for the still + the vision read.
@@ -1243,12 +1242,12 @@ async def run_event_listener(stop, publisher):
             await loop.run_in_executor(None, use_event_screenshot, key, shot)
         else:
             await loop.run_in_executor(None, event_grab, key)
-        # Event-still archive (Hassio-5sa / -bp8): if this cam + event match
+        # Event-still archive: if this cam + event match
         # ARCHIVE_RULES, snapshot the current still to the ZFS archive. Runs after
         # the still is written so it copies the freshest file (screenshot or grab).
         if should_archive(key, data):
             await loop.run_in_executor(None, archive_event_still, key)
-        # Gemini vision (Hassio-5sk): if this cam + event match VISION_RULES (and a
+        # Gemini vision: if this cam + event match VISION_RULES (and a
         # key+MQTT are configured), analyse the detection still (or a live burst when
         # there was none) and publish to the discovery sensor. vision_task is
         # best-effort (its own try/except).
@@ -1345,7 +1344,7 @@ def main():
     signal.signal(signal.SIGTERM, handle)
     signal.signal(signal.SIGINT, handle)
 
-    # Event-driven fast path (Hassio-i0w): opt-in via HA_TOKEN. The daemon thread
+    # Event-driven fast path: opt-in via HA_TOKEN. The daemon thread
     # shares `stop` and dies on process exit (SIGTERM/SIGINT set stop["flag"]).
     if HA_TOKEN:
         threading.Thread(

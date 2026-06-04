@@ -6,7 +6,7 @@
 # WHY: the live wyzeapi cameras are WebRTC-only -- /api/camera_proxy/<cam>
 # returns HTTP 500, so they render as GREY placeholder tiles on the auto-gen
 # Overview (one card per camera.* entity, using the entity as its own image
-# source -- no camera_image hook to swap in a still). The wyze-snapshot sidecar
+# source -- no camera_image hook to swap in a still). The wyze-vision sidecar
 # publishes working stills as camera.wyze_<key>_snapshot (local_file, HTTP 200
 # JPEG), which the Overview ALSO auto-generates cards for. Marking the live cams
 # hidden_by=user makes the Overview drop them, leaving only the working stills.
@@ -20,23 +20,26 @@
 # config-flow REST used by provision_local_file_cameras.sh). Uses websocat.
 #
 # Idempotent: entities already hidden_by=user are skipped, so it is safe to
-# re-run. Requires an ADMIN token (entity registry is admin-only); read from the
-# macOS Keychain, never hardcoded.
+# re-run. Requires an ADMIN token (entity registry is admin-only); never
+# hardcoded -- set HA_TOKEN, or on macOS store it in the login keychain.
 #
-# Usage: ./hide_live_wyze_cams.sh
+# Usage: HA_URL=... HA_TOKEN=... ./hide_live_wyze_cams.sh
 set -euo pipefail
 
-HA_URL="${HA_URL:-http://10.69.42.11:8123}"
-TOKEN="${HA_TOKEN:-$(security find-generic-password -a "$USER" -s home-assistant-token -w)}"
+# Point HA_URL at your Home Assistant; HA_TOKEN at an ADMIN long-lived access
+# token. Export HA_TOKEN directly, or wire it to your own secret store, e.g.:
+#   export HA_TOKEN="$(your-secret-tool get home-assistant-token)"
+HA_URL="${HA_URL:-http://homeassistant.local:8123}"
+TOKEN="${HA_TOKEN:?set HA_TOKEN to a Home Assistant admin long-lived access token}"
 WS_URL="${HA_URL/http/ws}/api/websocket"  # http://->ws://, https://->wss://
 
-# The 20 live wyzeapi cameras (camera.<key>). camera.backyard_2 (a GW_WC Sense
-# gateway mis-modeled as a camera) is deliberately excluded. The matching stills
-# camera.wyze_<key>_snapshot are left visible.
+# Your live wyzeapi cameras (camera.<key>). Edit this list to match your install.
+# Leave out any non-camera entity ha-wyzeapi mis-models as a camera (e.g. a Sense
+# hub gateway). The matching stills camera.wyze_<key>_snapshot are left visible.
 LIVE_KEYS=(
-  front_door garden catio studio shop toolbox roundabout cat_flap 3d_printer
-  garden_meadow greenhouse_north outside_studio tammy tbd back_yard_cam
-  sprouting_shed_1 sprouting_shed_2 garden_pan greenhouse back_greenhouse
+  front_door driveway backyard garage garden porch side_gate patio shed
+  greenhouse front_walk carport basement workshop pool mailbox side_yard
+  balcony deck courtyard
 )
 
 # ws_rpc: read newline-delimited command JSON on stdin, run one authenticated

@@ -9,45 +9,49 @@
 # /config/.storage/core.config_entries (not in the repo), so this idempotent
 # script is the version-controlled source of truth for creating them.
 #
-# Each entry shows a still JPEG written by the wyze-snapshot sidecar
+# Each entry shows a still JPEG written by the wyze-vision sidecar
 # (/config/wyze_snapshots/<key>.jpg). The entity_id is derived by HA from the
 # entry name: "Wyze <Title> Snapshot" -> camera.wyze_<key>_snapshot. The
 # Cameras dashboard (cameras-dashboard.yaml) renders these stills and taps
 # through to the live WebRTC camera.<key>.
 #
 # Idempotent: existing camera.wyze_<key>_snapshot entities are skipped, so it is
-# safe to re-run. Requires an ADMIN token (config flow is admin-only); read from
-# the macOS Keychain, never hardcoded.
+# safe to re-run. Requires an ADMIN token (config flow is admin-only); never
+# hardcoded -- set HA_TOKEN, or on macOS store it in the login keychain.
 #
-# Usage: ./provision_local_file_cameras.sh
+# Usage: HA_URL=... HA_TOKEN=... ./provision_local_file_cameras.sh
 set -euo pipefail
 
-HA_URL="${HA_URL:-http://10.69.42.11:8123}"
-TOKEN="${HA_TOKEN:-$(security find-generic-password -a "$USER" -s home-assistant-token -w)}"
+# Point HA_URL at your Home Assistant; HA_TOKEN at an ADMIN long-lived access
+# token. Export HA_TOKEN directly, or wire it to your own secret store, e.g.:
+#   export HA_TOKEN="$(your-secret-tool get home-assistant-token)"
+HA_URL="${HA_URL:-http://homeassistant.local:8123}"
+TOKEN="${HA_TOKEN:?set HA_TOKEN to a Home Assistant admin long-lived access token}"
 SNAP_DIR="${SNAP_DIR:-/config/wyze_snapshots}"
 
-# key (= jpg filename stem = live camera.<key>) | Title (slugifies back to key)
+# key (= jpg filename stem = live camera.<key>) | Title (slugifies back to key).
+# Edit this list to match your cameras.
 ENTRIES=(
   "front_door|Front Door"
+  "driveway|Driveway"
+  "backyard|Backyard"
+  "garage|Garage"
   "garden|Garden"
-  "catio|Catio"
-  "studio|Studio"
-  "shop|Shop"
-  "toolbox|Toolbox"
-  "roundabout|Roundabout"
-  "cat_flap|Cat Flap"
-  "3d_printer|3D Printer"
-  "garden_meadow|Garden Meadow"
-  "greenhouse_north|Greenhouse North"
-  "outside_studio|Outside Studio"
-  "tammy|Tammy"
-  "tbd|TBD"
-  "back_yard_cam|Back Yard Cam"
-  "sprouting_shed_1|Sprouting Shed 1"
-  "sprouting_shed_2|Sprouting Shed 2"
-  "garden_pan|Garden Pan"
+  "porch|Porch"
+  "side_gate|Side Gate"
+  "patio|Patio"
+  "shed|Shed"
   "greenhouse|Greenhouse"
-  "back_greenhouse|Back Greenhouse"
+  "front_walk|Front Walk"
+  "carport|Carport"
+  "basement|Basement"
+  "workshop|Workshop"
+  "pool|Pool"
+  "mailbox|Mailbox"
+  "side_yard|Side Yard"
+  "balcony|Balcony"
+  "deck|Deck"
+  "courtyard|Courtyard"
 )
 
 api() { curl -fsS -m 20 -H "Authorization: Bearer $TOKEN" "$@"; }
