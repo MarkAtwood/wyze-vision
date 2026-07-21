@@ -3,6 +3,6 @@
 # wyzeapy are imported at module top; paho-mqtt/websockets are imported lazily.
 wyzeapy==0.5.33
 requests==2.34.2
-Pillow==12.2.0
+Pillow==12.3.0
 paho-mqtt==2.1.0
 websockets==16.0
