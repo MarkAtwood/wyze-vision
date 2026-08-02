@@ -258,16 +258,18 @@ VISION_SCHEMA = {
         "package_present": {"type": "boolean"},
         "vehicle_present": {"type": "boolean"},
         "pet_present": {"type": "boolean"},
+        "salient": {"type": "boolean"},
         "notable": {"type": "string"},
     },
     "required": [
         "change_detected", "summary", "description", "motion", "people",
         "person_present", "package_present", "vehicle_present", "pet_present",
+        "salient",
     ],
     "propertyOrdering": [
         "change_detected", "summary", "description", "motion", "people",
         "person_present", "package_present", "vehicle_present", "pet_present",
-        "notable",
+        "salient", "notable",
     ],
 }
 
@@ -281,7 +283,10 @@ VISION_PROMPT = (
     "a fuller description of the scene; what is happening (and, across the frames if "
     "there are several, who/what moves, in which direction, what they are doing); "
     "counts and presence of people, packages, vehicles and pets; and anything notable "
-    "or concerning. If nothing of interest is present, say so plainly."
+    "or concerning. Set salient true only if something worth notifying a homeowner "
+    "about is present (person, package, vehicle, pet, or unusual activity); set "
+    "salient false for environmental motion (wind, leaves, shadows, lighting changes, "
+    "insects, birds, rain, small wildlife). If nothing of interest is present, say so."
 )
 
 # Reference-frame prompt (VISION_BASELINE on, baseline available): the recurring
@@ -299,8 +304,11 @@ VISION_PROMPT_BASELINE = (
     "and what it is doing. Counts and *_present flags must cover only things that are "
     "NOT part of the background. If the event image(s) are essentially identical to "
     "the background, set change_detected false, summary to 'no change', and every "
-    "*_present flag false. Otherwise set change_detected true. Note anything "
-    "concerning."
+    "*_present flag false. Otherwise set change_detected true. Set salient true only "
+    "if something worth notifying a homeowner about is present (person, package, "
+    "vehicle, pet, or unusual activity); set salient false for environmental motion "
+    "(wind, leaves, shadows, lighting changes, insects, birds, rain, small wildlife). "
+    "Note anything concerning."
 )
 
 # --- shared state between the periodic cycle and the event listener ----------
