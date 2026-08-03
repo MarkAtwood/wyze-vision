@@ -57,6 +57,8 @@ FRAME_ATTEMPTS = int(os.environ.get("FRAME_ATTEMPTS", "3"))
 CLIENT_ID = os.environ.get("CLIENT_ID", "ada06f08-87f4-4e13-b699-e82db8517ae5")
 # Persisted per-camera online history, used to date the "offline since" label.
 STATE_FILE = os.environ.get("STATE_FILE", os.path.join(OUT_DIR, ".offline_state.json"))
+# Persisted MAC -> slug map for detecting camera renames and cleaning up stale entities.
+RENAME_MAP_FILE = os.environ.get("RENAME_MAP_FILE", os.path.join(OUT_DIR, ".rename_map.json"))
 
 # Optional MQTT publish of each camera's Wyze cloud connection state, consumed
 # by the device-inventory sidecar to date its Wyze tab "Last Seen" from the
@@ -404,12 +406,13 @@ def wyze_offline_since(cam):
 async def collect_streams():
     """Enumerate cameras into online streams and offline placeholders.
 
-    Returns (streams, offline, conn):
+    Returns (streams, offline, conn, cameras):
       streams  = {stream_key: go2rtc_source_line} for reachable (online) cams,
       offline  = {stream_key: (nickname, since_epoch|None)} for offline cams,
                  where since_epoch is the Wyze cloud offline-transition time,
       conn     = {mac(lower,no-colon): (conn_state, conn_state_ts_ms)} for every
-                 camera that reports a conn_state, for the optional MQTT bridge.
+                 camera that reports a conn_state, for the optional MQTT bridge,
+      cameras  = raw camera list from wyzeapy (for rename detection).
     """
     access, refresh = load_tokens()
     auth = await WyzeAuthLib.create(token=Token(access, refresh, time.time() + 1e5))
@@ -457,7 +460,7 @@ async def collect_streams():
             log(f"  skip {key}: bad stream info ({exc})")
             continue
         log(f"  online {key}")
-    return streams, offline, conn
+    return streams, offline, conn, cameras
 
 
 def write_yaml(streams):
@@ -707,6 +710,110 @@ def save_state(state):
     os.replace(tmp, STATE_FILE)
 
 
+def load_rename_map():
+    """Load persisted {mac: slug} map for detecting camera renames."""
+    try:
+        with open(RENAME_MAP_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, ValueError):
+        return {}
+
+
+def save_rename_map(mapping):
+    """Persist the current {mac: slug} map."""
+    tmp = f"{RENAME_MAP_FILE}.tmp"
+    with open(tmp, "w") as f:
+        json.dump(mapping, f)
+    os.replace(tmp, RENAME_MAP_FILE)
+
+
+def cleanup_renamed_entities(old_slug, publisher):
+    """Delete HA entities and MQTT topics for a camera that was renamed.
+
+    When a camera is renamed in Wyze, the old slug-based entities become orphans.
+    This cleans up:
+      - camera.wyze_<old_slug>_snapshot (via HA websocket)
+      - sensor.wyze_vision_<old_slug>_vision (via HA websocket)
+      - MQTT discovery config + state/attributes topics (via empty retained publish)
+    """
+    # Clean up MQTT discovery and state topics (if publisher is connected)
+    if publisher and publisher.client:
+        # Clear vision sensor discovery config (empty retained = HA removes entity)
+        disco_topic = f"{VISION_DISCOVERY_PREFIX}/sensor/wyze_vision_{old_slug}/config"
+        publisher.client.publish(disco_topic, "", qos=1, retain=True)
+        # Clear vision state/attributes
+        publisher.client.publish(f"wyze/vision/{old_slug}/state", "", qos=1, retain=True)
+        publisher.client.publish(f"wyze/vision/{old_slug}/attributes", "", qos=1, retain=True)
+        log(f"  rename cleanup: cleared MQTT topics for {old_slug}")
+
+    # Clean up HA entity registry via websocket (requires HA_TOKEN)
+    if not HA_TOKEN:
+        return
+
+    import asyncio
+    import aiohttp
+
+    async def delete_entities():
+        stale_entities = [
+            f"camera.wyze_{old_slug}_snapshot",
+            f"sensor.wyze_vision_{old_slug}_vision",
+        ]
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.ws_connect(HA_URL) as ws:
+                    await ws.receive_json()  # auth_required
+                    await ws.send_json({"type": "auth", "access_token": HA_TOKEN})
+                    auth_result = await ws.receive_json()
+                    if auth_result.get("type") != "auth_ok":
+                        log(f"  rename cleanup: HA auth failed")
+                        return
+                    for i, eid in enumerate(stale_entities):
+                        await ws.send_json({
+                            "id": i + 1,
+                            "type": "config/entity_registry/remove",
+                            "entity_id": eid
+                        })
+                        result = await ws.receive_json()
+                        if result.get("success"):
+                            log(f"  rename cleanup: deleted {eid}")
+                        # Silently ignore if entity doesn't exist
+        except Exception as exc:
+            log(f"  rename cleanup: HA websocket error ({exc!r})")
+
+    asyncio.run(delete_entities())
+
+
+def detect_and_cleanup_renames(cameras, publisher):
+    """Detect camera renames and clean up orphaned entities.
+
+    Compares current {mac: slug} mapping to the persisted one. For any MAC
+    where the slug changed (camera renamed in Wyze), cleans up the old
+    slug's entities and MQTT topics.
+
+    Args:
+        cameras: list of camera objects from wyzeapy (have .mac and .nickname)
+        publisher: StatusPublisher instance for MQTT cleanup
+    """
+    old_map = load_rename_map()
+    new_map = {}
+
+    for cam in cameras:
+        mac = (getattr(cam, "mac", "") or "").lower().replace(":", "")
+        nickname = getattr(cam, "nickname", "") or ""
+        slug = stream_key(nickname)
+        if mac and slug:
+            new_map[mac] = slug
+
+    # Find renames: same MAC, different slug
+    for mac, new_slug in new_map.items():
+        old_slug = old_map.get(mac)
+        if old_slug and old_slug != new_slug:
+            log(f"  detected rename: {old_slug} -> {new_slug} (mac={mac})")
+            cleanup_renamed_entities(old_slug, publisher)
+
+    save_rename_map(new_map)
+
+
 def _font(size):
     """Scalable default font (Pillow >=10.1); fall back to the bitmap default."""
     try:
@@ -745,8 +852,9 @@ def render_offline(nickname, since_epoch):
 
 
 def cycle(go2rtc, publisher):
-    streams, offline, conn = asyncio.run(collect_streams())
+    streams, offline, conn, cameras = asyncio.run(collect_streams())
     publisher.publish(conn)
+    detect_and_cleanup_renames(cameras, publisher)
     now = int(time.time())
     state = load_state()
 
